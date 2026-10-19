@@ -34,8 +34,12 @@ pub fn box_filter<T: Pixel + bytemuck::Pod, const C: usize>(
     } else {
         anchor.1
     };
-    // u8 特派：SIMD 两阶段（行和 + 定点列归约）+ rayon 并行
-    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>() {
+    // u8 特派：SIMD 两阶段（行和 + 定点列归约）+ rayon 并行。
+    // area > 256 时 u16 中间缓冲会溢出，走标量 f64 路径
+    // （对齐 OpenCV：sumType = CV_32S，s0·scale double 乘 + cvRound）。
+    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<u8>()
+        && kw * kh <= 256
+    {
         let (w, h) = (src.width(), src.height());
         if w > 0 && h > 0 && ax >= 0 && (ax as usize) < kw && ay >= 0 && (ay as usize) < kh {
             // 此分支 T == u8（TypeId 已验证），按位转换参数
@@ -76,7 +80,10 @@ pub fn box_filter<T: Pixel + bytemuck::Pod, const C: usize>(
             }
             let oi = (y * w + x) * C;
             for c in 0..C {
-                out_data[oi + c] = T::from_f32((sum[c] * scale) as f32);
+                // 对齐 OpenCV CV_32S 路径：s0(int)·scale(double) → cvRound
+                // （f64 全程，不转 f32——f64→f32 中转会让 .5 边界错位）
+                let v = sum[c] * scale;
+                out_data[oi + c] = T::from_f64_round_even(v);
             }
         }
     }
@@ -104,7 +111,7 @@ fn box_filter_u8_simd<const C: usize>(
     // 缓冲但仅当 area <= 256 时行和才不溢出 u16：255*256 = 65280 < 65535）
     assert!(
         area <= 256,
-        "u8 SIMD path requires kw*kh <= 256 (got {area}); use scalar path"
+        "u8 SIMD path requires kw*kh <= 256 (got {area}); caller must dispatch to scalar"
     );
     let fx = crate::simd_kernels::box_filter::BoxFixed::from_area(area);
     // OpenCV：haveScale = scale != 1（area == 1 时 scale == 1，走无缩放路径）

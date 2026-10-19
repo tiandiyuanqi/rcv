@@ -12,3 +12,6 @@ thiserror = "2"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+[dev-dependencies]
+ab_glyph = "0.2.32"

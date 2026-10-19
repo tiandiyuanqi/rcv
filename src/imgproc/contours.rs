@@ -214,6 +214,7 @@ mod tests {
 
     /// 单个 3x3 方块：RETR_EXTERNAL 应恰好 1 条轮廓，8 点（角点环）。
     #[test]
+    #[allow(clippy::manual_range_contains)]
     fn single_square_external() {
         let src = img(8, 8, |x, y| (x >= 2 && x <= 4 && y >= 2 && y <= 4) as u8 * 255);
         let (contours, hier) = find_contours(
@@ -257,6 +258,7 @@ mod tests {
     #[test]
     fn nested_tree_hierarchy() {
         // 7x7 实心框（1 环）内 3x3 孔
+        #[allow(clippy::manual_range_contains)]
         let src = img(9, 9, |x, y| {
             let on_ring = x >= 1 && x <= 7 && y >= 1 && y <= 7 && !(x >= 3 && x <= 5 && y >= 3 && y <= 5);
             on_ring as u8 * 255
@@ -277,9 +279,11 @@ mod tests {
 
     /// RETR_LIST 与 RETR_TREE 轮廓集合一致（顺序可能不同，点集相同）。
     #[test]
+    #[allow(clippy::manual_range_contains)]
     fn list_vs_tree_consistency() {
+        #[allow(clippy::manual_range_contains)]
         let src = img(12, 12, |x, y| {
-            let a = x >= 1 && x <= 5 && y >= 1 && y <= 5 && !(x >= 3 && x <= 3 && y >= 3 && y <= 3);
+            let a = x >= 1 && x <= 5 && y >= 1 && y <= 5 && !(x == 3 && y == 3);
             let b = x >= 8 && x <= 10 && y >= 8 && y <= 10;
             (a || b) as u8 * 255
         });
@@ -326,6 +330,7 @@ mod tests {
     #[test]
     fn approx_simple_collapses_runs() {
         // 5x1 横线
+        #[allow(clippy::manual_range_contains)]
         let src = img(7, 3, |x, y| (y == 1 && x >= 1 && x <= 5) as u8 * 255);
         let (contours, _) = find_contours(
             &src,

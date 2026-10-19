@@ -175,6 +175,22 @@ mod tests {
         unsafe { to_grayscale_u8(&src, &mut dst_simd, n) };
         assert_eq!(dst_scalar, dst_simd, "AVX512 mismatch");
     }
+
+    #[test]
+    fn avx512_ycrcb_to_rgb_matches_scalar() {
+        let n = 100;
+        let mut src = vec![0u8; n * 3];
+        for i in 0..n {
+            src[i * 3] = (i * 7 % 256) as u8;
+            src[i * 3 + 1] = (i * 13 % 256) as u8;
+            src[i * 3 + 2] = (i * 29 % 256) as u8;
+        }
+        let mut dst_scalar = vec![0u8; n * 3];
+        let mut dst_simd = vec![0u8; n * 3];
+        crate::simd_kernels::cvt_color::scalar_ycrcb_to_rgb(&src, &mut dst_scalar, n);
+        unsafe { ycrcb_to_rgb(&src, &mut dst_simd, n) };
+        assert_eq!(dst_scalar, dst_simd, "AVX512 ycrcb_to_rgb mismatch");
+    }
 }
 
 /// u8 阈值化（AVX512，每批 64 元素，原生无符号掩码比较）。///
@@ -189,37 +205,117 @@ mod tests {
 pub unsafe fn threshold_u8(src: &[u8], dst: &mut [u8], n: usize, t: u8, mv: u8, type_: u8) {
     let thresh_u = _mm512_set1_epi8(t as i8);
     let maxval16 = _mm512_set1_epi8(mv as i8);
+    let zero = _mm512_setzero_si512();
+    // 非临时存储（movntdq）需 64 字节对齐 dst；先算对齐头，中部用流式写
+    // 避免写分配（RFO），提升纯流式带宽（实测 ~2-6%）。
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let head = ((64 - (dst_ptr & 63)) & 63).min(n);
     let mut i = 0;
     // SAFETY: 循环条件 i+64 <= n 保证读 [i, i+64) 不越界；CPU 特性由 isa() 派发保证
     unsafe {
-        while i + 64 <= n {
+        // 头部（< 64 字节，未对齐，标量）
+        while i < head {
+            let v = *src.get_unchecked(i);
+            *dst.get_unchecked_mut(i) = match type_ {
+                0 => if v > t { mv } else { 0 },
+                1 => if v <= t { mv } else { 0 },
+                2 => v.min(t),
+                3 => if v > t { v } else { 0 },
+                4 => if v <= t { v } else { 0 },
+                _ => v,
+            };
+            i += 1;
+        }
+        // 中部（64 字节对齐，非临时存储），4×64 展开隐藏 load/store 延迟
+        while i + 256 <= n {
             let v0 = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
-            let r = match type_ {
-                // Binary: v > t ? mv : 0
-                0 => _mm512_mask_mov_epi8(
-                    _mm512_setzero_si512(),
-                    _mm512_cmpgt_epu8_mask(v0, thresh_u),
-                    maxval16,
-                ),
-                // BinaryInv: v <= t ? mv : 0（v > t 处清零）
+            let v1 = _mm512_loadu_si512(src.as_ptr().add(i + 64) as *const __m512i);
+            let v2 = _mm512_loadu_si512(src.as_ptr().add(i + 128) as *const __m512i);
+            let v3 = _mm512_loadu_si512(src.as_ptr().add(i + 192) as *const __m512i);
+            let r0 = match type_ {
+                0 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v0, thresh_u), maxval16),
+                1 => _mm512_mask_mov_epi8(maxval16, _mm512_cmpgt_epu8_mask(v0, thresh_u), zero),
+                2 => _mm512_min_epu8(v0, thresh_u),
+                3 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v0, thresh_u), v0),
+                4 => _mm512_mask_mov_epi8(v0, _mm512_cmpgt_epu8_mask(v0, thresh_u), zero),
+                _ => v0,
+            };
+            let r1 = match type_ {
+                0 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v1, thresh_u), maxval16),
+                1 => _mm512_mask_mov_epi8(maxval16, _mm512_cmpgt_epu8_mask(v1, thresh_u), zero),
+                2 => _mm512_min_epu8(v1, thresh_u),
+                3 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v1, thresh_u), v1),
+                4 => _mm512_mask_mov_epi8(v1, _mm512_cmpgt_epu8_mask(v1, thresh_u), zero),
+                _ => v1,
+            };
+            let r2 = match type_ {
+                0 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v2, thresh_u), maxval16),
+                1 => _mm512_mask_mov_epi8(maxval16, _mm512_cmpgt_epu8_mask(v2, thresh_u), zero),
+                2 => _mm512_min_epu8(v2, thresh_u),
+                3 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v2, thresh_u), v2),
+                4 => _mm512_mask_mov_epi8(v2, _mm512_cmpgt_epu8_mask(v2, thresh_u), zero),
+                _ => v2,
+            };
+            let r3 = match type_ {
+                0 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v3, thresh_u), maxval16),
+                1 => _mm512_mask_mov_epi8(maxval16, _mm512_cmpgt_epu8_mask(v3, thresh_u), zero),
+                2 => _mm512_min_epu8(v3, thresh_u),
+                3 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v3, thresh_u), v3),
+                4 => _mm512_mask_mov_epi8(v3, _mm512_cmpgt_epu8_mask(v3, thresh_u), zero),
+                _ => v3,
+            };
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r0);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i + 64) as *mut __m512i, r1);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i + 128) as *mut __m512i, r2);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i + 192) as *mut __m512i, r3);
+            i += 256;
+        }
+        while i + 128 <= n {
+            let v0 = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            let v1 = _mm512_loadu_si512(src.as_ptr().add(i + 64) as *const __m512i);
+            let r0 = match type_ {
+                0 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v0, thresh_u), maxval16),
                 1 => _mm512_mask_mov_epi8(
                     maxval16,
                     _mm512_cmpgt_epu8_mask(v0, thresh_u),
-                    _mm512_setzero_si512(),
+                    zero,
                 ),
-                // Trunc: min(v, t)
                 2 => _mm512_min_epu8(v0, thresh_u),
-                // ToZero: v > t ? v : 0
                 3 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v0, thresh_u), v0),
-                // ToZeroInv: v <= t ? v : 0（v > t 处清零）
-                4 => _mm512_mask_mov_epi8(
-                    v0,
-                    _mm512_cmpgt_epu8_mask(v0, thresh_u),
-                    _mm512_setzero_si512(),
-                ),
+                4 => _mm512_mask_mov_epi8(v0, _mm512_cmpgt_epu8_mask(v0, thresh_u), zero),
                 _ => v0,
             };
-            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
+            let r1 = match type_ {
+                0 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v1, thresh_u), maxval16),
+                1 => _mm512_mask_mov_epi8(
+                    maxval16,
+                    _mm512_cmpgt_epu8_mask(v1, thresh_u),
+                    zero,
+                ),
+                2 => _mm512_min_epu8(v1, thresh_u),
+                3 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v1, thresh_u), v1),
+                4 => _mm512_mask_mov_epi8(v1, _mm512_cmpgt_epu8_mask(v1, thresh_u), zero),
+                _ => v1,
+            };
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r0);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i + 64) as *mut __m512i, r1);
+            i += 128;
+        }
+        while i + 64 <= n {
+            let v0 = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            let r = match type_ {
+                0 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v0, thresh_u), maxval16),
+                1 => _mm512_mask_mov_epi8(
+                    maxval16,
+                    _mm512_cmpgt_epu8_mask(v0, thresh_u),
+                    zero,
+                ),
+                2 => _mm512_min_epu8(v0, thresh_u),
+                3 => _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v0, thresh_u), v0),
+                4 => _mm512_mask_mov_epi8(v0, _mm512_cmpgt_epu8_mask(v0, thresh_u), zero),
+                _ => v0,
+            };
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
             i += 64;
         }
     }
@@ -227,6 +323,61 @@ pub unsafe fn threshold_u8(src: &[u8], dst: &mut [u8], n: usize, t: u8, mv: u8, 
     // SAFETY: AVX512F/BW/VL 蕴含 AVX2；切片长度 n-i 与子内核契约一致
     unsafe {
         avx2::threshold_u8(&src[i..], &mut dst[i..], n - i, t, mv, type_);
+    }
+}
+
+/// 二值阈值特化（type 0，THRESH_BINARY）：`dst = (src > t) ? mv : 0`。
+///
+/// 无 `match type_` 分支，热循环更紧凑。非临时存储 + 4×64 展开。
+///
+/// # Safety
+/// `n <= src.len() == dst.len()`；CPU 须支持 AVX512F/BW/VL。
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn threshold_binary_u8(src: &[u8], dst: &mut [u8], n: usize, t: u8, mv: u8) {
+    let thresh_u = _mm512_set1_epi8(t as i8);
+    let maxval16 = _mm512_set1_epi8(mv as i8);
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let head = ((64 - (dst_ptr & 63)) & 63).min(n);
+    let mut i = 0;
+    // SAFETY: 循环条件 i+64 <= n 保证读 [i, i+64) 不越界
+    unsafe {
+        while i < head {
+            *dst.get_unchecked_mut(i) = if *src.get_unchecked(i) > t { mv } else { 0 };
+            i += 1;
+        }
+        while i + 256 <= n {
+            let v0 = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            let v1 = _mm512_loadu_si512(src.as_ptr().add(i + 64) as *const __m512i);
+            let v2 = _mm512_loadu_si512(src.as_ptr().add(i + 128) as *const __m512i);
+            let v3 = _mm512_loadu_si512(src.as_ptr().add(i + 192) as *const __m512i);
+            let r0 = _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v0, thresh_u), maxval16);
+            let r1 = _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v1, thresh_u), maxval16);
+            let r2 = _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v2, thresh_u), maxval16);
+            let r3 = _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v3, thresh_u), maxval16);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r0);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i + 64) as *mut __m512i, r1);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i + 128) as *mut __m512i, r2);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i + 192) as *mut __m512i, r3);
+            i += 256;
+        }
+        while i + 128 <= n {
+            let v0 = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            let v1 = _mm512_loadu_si512(src.as_ptr().add(i + 64) as *const __m512i);
+            let r0 = _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v0, thresh_u), maxval16);
+            let r1 = _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v1, thresh_u), maxval16);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r0);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i + 64) as *mut __m512i, r1);
+            i += 128;
+        }
+        while i + 64 <= n {
+            let v0 = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            let r0 = _mm512_maskz_mov_epi8(_mm512_cmpgt_epu8_mask(v0, thresh_u), maxval16);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r0);
+            i += 64;
+        }
+    }
+    if i < n {
+        crate::simd_kernels::scalar::threshold_u8(&src[i..], &mut dst[i..], n - i, t, mv, 0);
     }
 }
 
@@ -554,6 +705,39 @@ pub unsafe fn box_row_sum_u8_direct_cn(
     cn: usize,
     border: crate::core::border::BorderPolicy<u8>,
 ) {
+    if kw == 3 && cn == 3 {
+        // C=3、kw=3 特化：dst[i] = src[i-3] + src[i] + src[i+3]（3 抽头，步长 1）
+        let total = w * cn;
+        let lo = 3;
+        let hi = total.saturating_sub(3);
+        let mut i = lo;
+        // SAFETY: i+64 <= hi 保证读 [i-3, i+67) 写 [i, i+64) 不越界
+        unsafe {
+            while i + 64 <= hi {
+                let a = _mm512_loadu_si512(src.as_ptr().add(i - 3) as *const __m512i);
+                let b = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+                let c = _mm512_loadu_si512(src.as_ptr().add(i + 3) as *const __m512i);
+                // 各 u8 向量零扩展为低/高 256 位两个 u16 向量
+                let a0 = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(a));
+                let a1 = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(a, 1));
+                let b0 = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(b));
+                let b1 = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(b, 1));
+                let c0 = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(c));
+                let c1 = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(c, 1));
+                let s0 = _mm512_add_epi16(_mm512_add_epi16(a0, b0), c0);
+                let s1 = _mm512_add_epi16(_mm512_add_epi16(a1, b1), c1);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, s0);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(i + 32) as *mut __m512i, s1);
+                i += 64;
+            }
+        }
+        // 剩余标量
+        for j in i..hi {
+            dst[j] = src[j - 3] as u16 + src[j] as u16 + src[j + 3] as u16;
+        }
+        crate::simd_kernels::box_filter::row_sum_edges(src, dst, w, kw, cn, border);
+        return;
+    }
     // SAFETY: AVX512F/BW/VL 蕴含 AVX2；切片长度与子内核契约一致
     unsafe { avx2::box_row_sum_u8_direct_cn(src, dst, w, kw, cn, border) }
 }
@@ -2217,11 +2401,21 @@ unsafe fn laplacian_diag_core_512(
 #[target_feature(enable = "avx512f")]
 pub unsafe fn magnitude32f(x: &[f32], y: &[f32], dst: &mut [f32], n: usize) {
     let mut i = 0usize;
+    // 非临时存储（movntps）需 64 字节对齐 dst；避免写分配（RFO），
+    // 提升 3 流（2 读 + 1 写）纯流式带宽。
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let head = (((64 - (dst_ptr & 63)) & 63) / 4).min(n);
     // SAFETY: i+64 <= n 保证读 [i, i+64)×2 写 [i, i+64) 不越界
     unsafe {
-        let mut px = x.as_ptr();
-        let mut py = y.as_ptr();
-        let mut pd = dst.as_mut_ptr();
+        // 头部（< 16 元素，未对齐，标量）
+        while i < head {
+            *dst.get_unchecked_mut(i) = (x[i] * x[i] + y[i] * y[i]).sqrt();
+            i += 1;
+        }
+        // 中部（64 字节对齐，非临时存储）
+        let mut px = x.as_ptr().add(i);
+        let mut py = y.as_ptr().add(i);
+        let mut pd = dst.as_mut_ptr().add(i);
         while i + 64 <= n {
             let vx0 = _mm512_loadu_ps(px);
             let vy0 = _mm512_loadu_ps(py);
@@ -2235,10 +2429,10 @@ pub unsafe fn magnitude32f(x: &[f32], y: &[f32], dst: &mut [f32], n: usize) {
             let m1 = _mm512_sqrt_ps(_mm512_fmadd_ps(vx1, vx1, _mm512_mul_ps(vy1, vy1)));
             let m2 = _mm512_sqrt_ps(_mm512_fmadd_ps(vx2, vx2, _mm512_mul_ps(vy2, vy2)));
             let m3 = _mm512_sqrt_ps(_mm512_fmadd_ps(vx3, vx3, _mm512_mul_ps(vy3, vy3)));
-            _mm512_storeu_ps(pd, m0);
-            _mm512_storeu_ps(pd.add(16), m1);
-            _mm512_storeu_ps(pd.add(32), m2);
-            _mm512_storeu_ps(pd.add(48), m3);
+            _mm512_stream_ps(pd, m0);
+            _mm512_stream_ps(pd.add(16), m1);
+            _mm512_stream_ps(pd.add(32), m2);
+            _mm512_stream_ps(pd.add(48), m3);
             px = px.add(64);
             py = py.add(64);
             pd = pd.add(64);
@@ -2309,8 +2503,24 @@ pub unsafe fn cart_to_polar32f(
     };
     let vs = _mm512_set1_ps(scale);
     let mut i = 0usize;
-    // SAFETY: i+16 <= n 保证读 [i, i+16)×2 写 [i, i+16)×2 不越界
+    // SAFETY: i+32 <= n 保证读 [i, i+32)×2 写 [i, i+32)×2 不越界
     unsafe {
+        // 2×16 展开（对齐 OpenCV 2×VECSZ），隐藏 _mm512_div_ps 高延迟
+        while i + 32 <= n {
+            let x0 = _mm512_loadu_ps(x.as_ptr().add(i));
+            let y0 = _mm512_loadu_ps(y.as_ptr().add(i));
+            let x1 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
+            let y1 = _mm512_loadu_ps(y.as_ptr().add(i + 16));
+            let m0 = _mm512_sqrt_ps(_mm512_fmadd_ps(x0, x0, _mm512_mul_ps(y0, y0)));
+            let m1 = _mm512_sqrt_ps(_mm512_fmadd_ps(x1, x1, _mm512_mul_ps(y1, y1)));
+            let a0 = _mm512_mul_ps(atan_vec_512(y0, x0), vs);
+            let a1 = _mm512_mul_ps(atan_vec_512(y1, x1), vs);
+            _mm512_storeu_ps(mag.as_mut_ptr().add(i), m0);
+            _mm512_storeu_ps(mag.as_mut_ptr().add(i + 16), m1);
+            _mm512_storeu_ps(angle.as_mut_ptr().add(i), a0);
+            _mm512_storeu_ps(angle.as_mut_ptr().add(i + 16), a1);
+            i += 32;
+        }
         while i + 16 <= n {
             let vx = _mm512_loadu_ps(x.as_ptr().add(i));
             let vy = _mm512_loadu_ps(y.as_ptr().add(i));
@@ -2609,7 +2819,7 @@ pub unsafe fn canny_nms_row(
                 // SAFETY: compressstore 写 i32（4 字节）到临时缓冲，随后逐元素
                 // 转 usize 追加到栈（避免 resize 清零 + 破坏 usize 布局）
                 let mut tmp = [0i32; 16];
-                _mm512_mask_compressstoreu_epi32(tmp.as_mut_ptr() as *mut i32, k_strong, cols);
+                _mm512_mask_compressstoreu_epi32(tmp.as_mut_ptr(), k_strong, cols);
                 stack.extend(tmp.iter().take(cnt).map(|&t| t as usize));
             }
             j += 16;
@@ -2690,6 +2900,82 @@ pub unsafe fn find_end_contour_point(row: &[u8], j: usize) -> usize {
     k
 }
 
+/// 单趟扫描一行，返回所有 run 边界 `[start, end)`（start/end 为行内下标）。
+///
+/// 对齐 OpenCV TRU 的 findStart/findEnd 交替扫描，但用单趟 AVX512 块扫描
+/// 消除逐 run 的分支预测抖动（bench 图 35K runs 时扫描占 0.65ms/1.12ms）。
+///
+/// # Safety
+/// `row` 长度 ≥ 1；`starts`/`ends` 复用缓冲（调用方 clear）。
+#[inline(never)]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn scan_row_runs(row: &[u8], starts: &mut Vec<u32>, ends: &mut Vec<u32>) {
+    starts.clear();
+    ends.clear();
+    let width = row.len();
+    let zero = _mm512_setzero_si512();
+    let mut k = 1usize;
+    let mut in_run = false;
+    let mut run_start = 0u32;
+    // SAFETY: k + 64 <= width 保证 load [k, k+64) 在界内
+    while k + 64 <= width {
+        // SAFETY: 循环条件保证 load 在界内
+        unsafe {
+        let v = _mm512_loadu_si512(row.as_ptr().add(k) as *const __m512i);
+        let mask = !_mm512_cmpeq_epi8_mask(v, zero);
+        let mut m = mask;
+        // 上一块末尾的 run 在本块开头结束
+        if in_run && (m & 1) == 0 {
+            starts.push(run_start);
+            ends.push(k as u32);
+            in_run = false;
+        }
+        // 块内已消费的位偏移（m 被逐步右移，tz/to 相对当前 m）
+        let mut bit = 0usize;
+        while m != 0 {
+            let tz = m.trailing_zeros() as usize;
+            let p = k + bit + tz;
+            let shifted = m >> tz;
+            let to = shifted.trailing_ones() as usize;
+            let end = p + to;
+            if !in_run {
+                run_start = p as u32;
+            }
+            if bit + tz + to == 64 {
+                // run 延伸到块末尾
+                in_run = true;
+                m = 0;
+            } else {
+                starts.push(run_start);
+                ends.push(end as u32);
+                in_run = false;
+                m = shifted >> to;
+                bit += tz + to;
+            }
+        }
+        }
+        k += 64;
+    }
+    // 尾部（< 64 字节）
+    while k < width {
+        if row[k] != 0 {
+            if !in_run {
+                run_start = k as u32;
+                in_run = true;
+            }
+        } else if in_run {
+            starts.push(run_start);
+            ends.push(k as u32);
+            in_run = false;
+        }
+        k += 1;
+    }
+    if in_run {
+        starts.push(run_start);
+        ends.push(width as u32);
+    }
+}
+
 /// Suzuki findNextX：行内找第一个与 `prev` 不同的 i8（从 `j` 到 `width`）。
 ///
 /// 调用方已做首元素检查。
@@ -2733,13 +3019,23 @@ pub unsafe fn find_next_diff(row: &[i8], j: usize, width: usize, prev: i8, p: &m
 #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
 pub unsafe fn bitwise_and_bytes(a: &[u8], b: &[u8], dst: &mut [u8], n: usize) {
     let mut i = 0;
+    // 非临时存储（movntdq）需 64 字节对齐 dst；避免写分配（RFO），
+    // 提升 3 流（2 读 + 1 写）纯流式带宽。
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let head = ((64 - (dst_ptr & 63)) & 63).min(n);
     // SAFETY: 循环条件 i+64 <= n 保证读 [i, i+64) 不越界
     unsafe {
+        // 头部（< 64 字节，未对齐，标量）
+        while i < head {
+            *dst.get_unchecked_mut(i) = *a.get_unchecked(i) & *b.get_unchecked(i);
+            i += 1;
+        }
+        // 中部（64 字节对齐，非临时存储）
         while i + 64 <= n {
             let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
             let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
             let r = _mm512_and_si512(va, vb);
-            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
             i += 64;
         }
     }
@@ -2755,13 +3051,19 @@ pub unsafe fn bitwise_and_bytes(a: &[u8], b: &[u8], dst: &mut [u8], n: usize) {
 #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
 pub unsafe fn bitwise_or_bytes(a: &[u8], b: &[u8], dst: &mut [u8], n: usize) {
     let mut i = 0;
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let head = ((64 - (dst_ptr & 63)) & 63).min(n);
     // SAFETY: 循环条件 i+64 <= n 保证读 [i, i+64) 不越界
     unsafe {
+        while i < head {
+            *dst.get_unchecked_mut(i) = *a.get_unchecked(i) | *b.get_unchecked(i);
+            i += 1;
+        }
         while i + 64 <= n {
             let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
             let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
             let r = _mm512_or_si512(va, vb);
-            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
             i += 64;
         }
     }
@@ -2777,13 +3079,19 @@ pub unsafe fn bitwise_or_bytes(a: &[u8], b: &[u8], dst: &mut [u8], n: usize) {
 #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
 pub unsafe fn bitwise_xor_bytes(a: &[u8], b: &[u8], dst: &mut [u8], n: usize) {
     let mut i = 0;
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let head = ((64 - (dst_ptr & 63)) & 63).min(n);
     // SAFETY: 循环条件 i+64 <= n 保证读 [i, i+64) 不越界
     unsafe {
+        while i < head {
+            *dst.get_unchecked_mut(i) = *a.get_unchecked(i) ^ *b.get_unchecked(i);
+            i += 1;
+        }
         while i + 64 <= n {
             let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
             let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
             let r = _mm512_xor_si512(va, vb);
-            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
             i += 64;
         }
     }
@@ -2802,18 +3110,1258 @@ pub unsafe fn bitwise_xor_bytes(a: &[u8], b: &[u8], dst: &mut [u8], n: usize) {
 #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
 pub unsafe fn bitwise_not_bytes(a: &[u8], dst: &mut [u8], n: usize) {
     let mut i = 0;
+    // 非临时存储（movntdq）需 64 字节对齐 dst；避免写分配（RFO）。
+    // 输出为每次新分配（冷），流式写绕过 RFO 提升 2 流带宽。
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let head = ((64 - (dst_ptr & 63)) & 63).min(n);
+    let ones = _mm512_set1_epi8(-1);
     // SAFETY: 循环条件 i+64 <= n 保证读 [i, i+64) 不越界
     unsafe {
+        // 头部（< 64 字节，未对齐，标量）
+        while i < head {
+            *dst.get_unchecked_mut(i) = !*a.get_unchecked(i);
+            i += 1;
+        }
+        // 中部（64 字节对齐，非临时存储），2×64 展开隐藏 load/store 延迟
+        while i + 128 <= n {
+            let va0 = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+            let va1 = _mm512_loadu_si512(a.as_ptr().add(i + 64) as *const __m512i);
+            let r0 = _mm512_xor_si512(va0, ones);
+            let r1 = _mm512_xor_si512(va1, ones);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r0);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i + 64) as *mut __m512i, r1);
+            i += 128;
+        }
         while i + 64 <= n {
             let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
-            // ternlog 三操作数全 a：真值表索引仅 0（a=0）与 7（a=1）有效。
-            // ~a 需索引 0 → 1、索引 7 → 0，即 imm bit0=1 → imm=0x01
-            let r = _mm512_ternarylogic_epi32(va, va, va, 0x01);
-            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
+            let r = _mm512_xor_si512(va, ones);
+            _mm512_stream_si512(dst.as_mut_ptr().add(i) as *mut __m512i, r);
             i += 64;
         }
     }
     if i < n {
         crate::simd_kernels::scalar::bitwise_not_bytes(&a[i..], &mut dst[i..], n - i);
+    }
+}
+
+/// 3×3 距离变换前向扫描（AVX512，每批 16 像素）。
+///
+/// 向量化 top 行 min 计算（`min(top[j-1]+diag, top[j]+hv, top[j+1]+diag)`），
+/// 标量修复 `left` 依赖（对齐 OpenCV `distanceTransform_3x3` 的 SIMD 路径）。
+///
+/// `temp` 为含 border 哨兵的 u32 缓冲，`step` 为行步长（含 border），
+/// `row` 为当前行起始索引（含 border），`s` 为当前行源像素。
+///
+/// # Safety
+/// - `temp` 长度 ≥ `(row + step) + border + w + 1`
+/// - `s` 长度 ≥ `w`
+/// - CPU 需支持 AVX512F/BW/VL
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn dist_forward_3x3(
+    temp: &mut [u32],
+    s: &[u8],
+    w: usize,
+    step: usize,
+    row: usize,
+    border: usize,
+    hv_dist: u32,
+    diag_dist: u32,
+    dist_max: u32,
+) {
+    let v_hv = _mm512_set1_epi32(hv_dist as i32);
+    let v_diag = _mm512_set1_epi32(diag_dist as i32);
+    let v_max = _mm512_set1_epi32(u32::MAX as i32);
+    // 折叠 ramp：lane k 贡献 (k+1)*hv（前向，从左到右）
+    let v_ramp1 = _mm512_set_epi32(
+        (16 * hv_dist) as i32,
+        (15 * hv_dist) as i32,
+        (14 * hv_dist) as i32,
+        (13 * hv_dist) as i32,
+        (12 * hv_dist) as i32,
+        (11 * hv_dist) as i32,
+        (10 * hv_dist) as i32,
+        (9 * hv_dist) as i32,
+        (8 * hv_dist) as i32,
+        (7 * hv_dist) as i32,
+        (6 * hv_dist) as i32,
+        (5 * hv_dist) as i32,
+        (4 * hv_dist) as i32,
+        (3 * hv_dist) as i32,
+        (2 * hv_dist) as i32,
+        (1 * hv_dist) as i32,
+    );
+    // 扫描 clamp 常量：dist_max - s*hv（避免加法回绕产生假胜出）
+    let v_c1 = _mm512_set1_epi32((dist_max - 1 * hv_dist) as i32);
+    let v_c2 = _mm512_set1_epi32((dist_max - 2 * hv_dist) as i32);
+    let v_c4 = _mm512_set1_epi32((dist_max - 4 * hv_dist) as i32);
+    let v_c8 = _mm512_set1_epi32((dist_max - 8 * hv_dist) as i32);
+    let v_s1 = _mm512_set1_epi32((1 * hv_dist) as i32);
+    let v_s2 = _mm512_set1_epi32((2 * hv_dist) as i32);
+    let v_s4 = _mm512_set1_epi32((4 * hv_dist) as i32);
+    let v_s8 = _mm512_set1_epi32((8 * hv_dist) as i32);
+    // 前缀扫描有效掩码：step s 有效 lane k >= s
+    let m1 = !0u16 << 1;
+    let m2 = !0u16 << 2;
+    let m4 = !0u16 << 4;
+    let m8 = !0u16 << 8;
+
+    let nb = w / 16;
+    let tail = w % 16;
+    let base = tail; // 块覆盖 [tail, w)
+
+    // Phase 1: 局部前缀扫描（块独立，向量化 top 行 min + 零掩码）
+    unsafe {
+        for b in 0..nb {
+            let j = base + 16 * b;
+            let top = temp.as_ptr().add(row - step + border + j - 1);
+            let tl = _mm512_loadu_si512(top as *const __m512i);
+            let t = _mm512_loadu_si512(top.add(1) as *const __m512i);
+            let tr = _mm512_loadu_si512(top.add(2) as *const __m512i);
+            let m = _mm512_min_epu32(
+                _mm512_min_epu32(
+                    _mm512_add_epi32(tl, v_diag),
+                    _mm512_add_epi32(t, v_hv),
+                ),
+                _mm512_add_epi32(tr, v_diag),
+            );
+            let m = _mm512_min_epu32(m, _mm512_set1_epi32(dist_max as i32));
+            // 零掩码：s[j]==0 的 lane 置 0（_mm_test_epi8_mask 置位非零字节，取反）
+            let sv = _mm_loadu_si128(s.as_ptr().add(j) as *const __m128i);
+            let zm = _mm_test_epi8_mask(sv, sv);
+            let mut a = _mm512_mask_mov_epi32(m, !zm, _mm512_setzero_si512());
+            // 前缀扫描：s=1,2,4,8
+            let src = _mm512_alignr_epi32(a, a, 15);
+            let src = _mm512_min_epu32(src, v_c1);
+            let t = _mm512_add_epi32(src, v_s1);
+            a = _mm512_mask_min_epu32(a, m1, a, t);
+            let src = _mm512_alignr_epi32(a, a, 14);
+            let src = _mm512_min_epu32(src, v_c2);
+            let t = _mm512_add_epi32(src, v_s2);
+            a = _mm512_mask_min_epu32(a, m2, a, t);
+            let src = _mm512_alignr_epi32(a, a, 12);
+            let src = _mm512_min_epu32(src, v_c4);
+            let t = _mm512_add_epi32(src, v_s4);
+            a = _mm512_mask_min_epu32(a, m4, a, t);
+            let src = _mm512_alignr_epi32(a, a, 8);
+            let src = _mm512_min_epu32(src, v_c8);
+            let t = _mm512_add_epi32(src, v_s8);
+            a = _mm512_mask_min_epu32(a, m8, a, t);
+            _mm512_storeu_si512(temp.as_mut_ptr().add(row + border + j) as *mut __m512i, a);
+        }
+    }
+
+    // 标量尾部（最左 [0, tail) 像素，含 left 依赖）
+    let mut left = temp[row + border - 1];
+    for j in 0..tail {
+        let idx = row + border + j;
+        if s[j] == 0 {
+            temp[idx] = 0;
+            left = 0;
+        } else {
+            let t0 = temp[idx - step - 1].wrapping_add(diag_dist);
+            let t1 = temp[idx - step].wrapping_add(hv_dist);
+            let t2 = temp[idx - step + 1].wrapping_add(diag_dist);
+            let t3 = left.wrapping_add(hv_dist);
+            let mut m = t0.min(t1);
+            m = m.min(t2);
+            m = m.min(t3);
+            temp[idx] = if m > dist_max { dist_max } else { m };
+            left = temp[idx];
+        }
+    }
+
+    // Phase 2+3: 串行 stitch + 折叠（块从左到右，lane15 输出即下一块 incoming）
+    let mut l = left;
+    unsafe {
+        for b in 0..nb {
+            let j = base + 16 * b;
+            let local = _mm512_loadu_si512(temp.as_ptr().add(row + border + j) as *const __m512i);
+            let vl = _mm512_set1_epi32(l as i32);
+            let t = _mm512_add_epi32(vl, v_ramp1);
+            let wrap = _mm512_cmplt_epu32_mask(t, vl);
+            let t = _mm512_mask_mov_epi32(t, wrap, v_max);
+            let v = _mm512_min_epu32(local, t);
+            l = _mm_extract_epi32(_mm512_extracti32x4_epi32(v, 3), 3) as u32;
+            _mm512_storeu_si512(temp.as_mut_ptr().add(row + border + j) as *mut __m512i, v);
+        }
+    }
+}
+
+/// 5×5 距离变换前向扫描（AVX512，每批 16 像素）。
+///
+/// 向量化 top1/top2 行 min 计算，标量修复 `left1`/`left2` 依赖
+/// （对齐 OpenCV `distanceTransform_5x5` 的 SIMD 路径）。
+///
+/// # Safety
+/// - `temp` 长度 ≥ `(row + 2*step) + border + w + 2`
+/// - `s` 长度 ≥ `w`
+/// - CPU 需支持 AVX512F/BW/VL
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn dist_forward_5x5(
+    temp: &mut [u32],
+    s: &[u8],
+    w: usize,
+    step: usize,
+    row: usize,
+    border: usize,
+    hv_dist: u32,
+    diag_dist: u32,
+    long_dist: u32,
+    dist_max: u32,
+) {
+    let v_hv = _mm512_set1_epi32(hv_dist as i32);
+    let v_diag = _mm512_set1_epi32(diag_dist as i32);
+    let v_long = _mm512_set1_epi32(long_dist as i32);
+    let v_max = _mm512_set1_epi32(u32::MAX as i32);
+    // 折叠 ramp：lane k 贡献 (k+1)*hv（前向，从左到右）
+    let v_ramp1 = _mm512_set_epi32(
+        (16 * hv_dist) as i32,
+        (15 * hv_dist) as i32,
+        (14 * hv_dist) as i32,
+        (13 * hv_dist) as i32,
+        (12 * hv_dist) as i32,
+        (11 * hv_dist) as i32,
+        (10 * hv_dist) as i32,
+        (9 * hv_dist) as i32,
+        (8 * hv_dist) as i32,
+        (7 * hv_dist) as i32,
+        (6 * hv_dist) as i32,
+        (5 * hv_dist) as i32,
+        (4 * hv_dist) as i32,
+        (3 * hv_dist) as i32,
+        (2 * hv_dist) as i32,
+        (1 * hv_dist) as i32,
+    );
+    // 扫描 clamp 常量：dist_max - s*hv（避免加法回绕产生假胜出）
+    let v_c1 = _mm512_set1_epi32((dist_max - 1 * hv_dist) as i32);
+    let v_c2 = _mm512_set1_epi32((dist_max - 2 * hv_dist) as i32);
+    let v_c4 = _mm512_set1_epi32((dist_max - 4 * hv_dist) as i32);
+    let v_c8 = _mm512_set1_epi32((dist_max - 8 * hv_dist) as i32);
+    let v_s1 = _mm512_set1_epi32((1 * hv_dist) as i32);
+    let v_s2 = _mm512_set1_epi32((2 * hv_dist) as i32);
+    let v_s4 = _mm512_set1_epi32((4 * hv_dist) as i32);
+    let v_s8 = _mm512_set1_epi32((8 * hv_dist) as i32);
+    // 前缀扫描有效掩码：step s 有效 lane k >= s
+    let m1 = !0u16 << 1;
+    let m2 = !0u16 << 2;
+    let m4 = !0u16 << 4;
+    let m8 = !0u16 << 8;
+
+    let nb = w / 16;
+    let tail = w % 16;
+    let base = tail; // 块覆盖 [tail, w)
+
+    // Phase 1: 局部前缀扫描（块独立，向量化 top1/top2 行 min + 零掩码）
+    unsafe {
+        for b in 0..nb {
+            let j = base + 16 * b;
+            let top1 = temp.as_ptr().add(row - step + border + j - 2);
+            let top2 = temp.as_ptr().add(row - 2 * step + border + j - 1);
+            let t2m1 = _mm512_loadu_si512(top2 as *const __m512i);
+            let t2p1 = _mm512_loadu_si512(top2.add(2) as *const __m512i);
+            let t1m2 = _mm512_loadu_si512(top1 as *const __m512i);
+            let t1m1 = _mm512_loadu_si512(top1.add(1) as *const __m512i);
+            let t1 = _mm512_loadu_si512(top1.add(2) as *const __m512i);
+            let t1p1 = _mm512_loadu_si512(top1.add(3) as *const __m512i);
+            let t1p2 = _mm512_loadu_si512(top1.add(4) as *const __m512i);
+            let m = _mm512_min_epu32(
+                _mm512_min_epu32(
+                    _mm512_min_epu32(
+                        _mm512_add_epi32(t2m1, v_long),
+                        _mm512_add_epi32(t2p1, v_long),
+                    ),
+                    _mm512_min_epu32(
+                        _mm512_add_epi32(t1m2, v_long),
+                        _mm512_add_epi32(t1m1, v_diag),
+                    ),
+                ),
+                _mm512_min_epu32(
+                    _mm512_min_epu32(
+                        _mm512_add_epi32(t1, v_hv),
+                        _mm512_add_epi32(t1p1, v_diag),
+                    ),
+                    _mm512_add_epi32(t1p2, v_long),
+                ),
+            );
+            let m = _mm512_min_epu32(m, _mm512_set1_epi32(dist_max as i32));
+            // 零掩码：s[j]==0 的 lane 置 0（_mm_test_epi8_mask 置位非零字节，取反）
+            let sv = _mm_loadu_si128(s.as_ptr().add(j) as *const __m128i);
+            let zm = _mm_test_epi8_mask(sv, sv);
+            let mut a = _mm512_mask_mov_epi32(m, !zm, _mm512_setzero_si512());
+            // 前缀扫描：s=1,2,4,8
+            let src = _mm512_alignr_epi32(a, a, 15);
+            let src = _mm512_min_epu32(src, v_c1);
+            let t = _mm512_add_epi32(src, v_s1);
+            a = _mm512_mask_min_epu32(a, m1, a, t);
+            let src = _mm512_alignr_epi32(a, a, 14);
+            let src = _mm512_min_epu32(src, v_c2);
+            let t = _mm512_add_epi32(src, v_s2);
+            a = _mm512_mask_min_epu32(a, m2, a, t);
+            let src = _mm512_alignr_epi32(a, a, 12);
+            let src = _mm512_min_epu32(src, v_c4);
+            let t = _mm512_add_epi32(src, v_s4);
+            a = _mm512_mask_min_epu32(a, m4, a, t);
+            let src = _mm512_alignr_epi32(a, a, 8);
+            let src = _mm512_min_epu32(src, v_c8);
+            let t = _mm512_add_epi32(src, v_s8);
+            a = _mm512_mask_min_epu32(a, m8, a, t);
+            _mm512_storeu_si512(temp.as_mut_ptr().add(row + border + j) as *mut __m512i, a);
+        }
+    }
+
+    // 标量尾部（最左 [0, tail) 像素，含 left 依赖）
+    let mut left = temp[row + border - 1];
+    for j in 0..tail {
+        let idx = row + border + j;
+        if s[j] == 0 {
+            temp[idx] = 0;
+            left = 0;
+        } else {
+            let mut t0 = temp[idx - 2 * step - 1].wrapping_add(long_dist);
+            let mut t = temp[idx - 2 * step + 1].wrapping_add(long_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx - step - 2].wrapping_add(long_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx - step - 1].wrapping_add(diag_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx - step].wrapping_add(hv_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx - step + 1].wrapping_add(diag_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx - step + 2].wrapping_add(long_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = left.wrapping_add(hv_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            temp[idx] = if t0 > dist_max { dist_max } else { t0 };
+            left = temp[idx];
+        }
+    }
+
+    // Phase 2+3: 串行 stitch + 折叠（块从左到右，lane15 输出即下一块 incoming）
+    let mut l = left;
+    unsafe {
+        for b in 0..nb {
+            let j = base + 16 * b;
+            let local = _mm512_loadu_si512(temp.as_ptr().add(row + border + j) as *const __m512i);
+            let vl = _mm512_set1_epi32(l as i32);
+            let t = _mm512_add_epi32(vl, v_ramp1);
+            let wrap = _mm512_cmplt_epu32_mask(t, vl);
+            let t = _mm512_mask_mov_epi32(t, wrap, v_max);
+            let v = _mm512_min_epu32(local, t);
+            l = _mm_extract_epi32(_mm512_extracti32x4_epi32(v, 3), 3) as u32;
+            _mm512_storeu_si512(temp.as_mut_ptr().add(row + border + j) as *mut __m512i, v);
+        }
+    }
+}
+
+/// 5×5 距离变换后向扫描（AVX512，每批 16 像素）。
+///
+/// 向量化 bot1/bot2 行 min 计算，标量修复 `right` 依赖（对齐 OpenCV）。
+/// 定点 → 浮点转换向量化。
+///
+/// # Safety
+/// - `temp` 长度 ≥ `(row + 2*step) + border + w + 2`
+/// - `drow` 长度 ≥ `w`
+/// - CPU 需支持 AVX512F/BW/VL
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn dist_backward_5x5(
+    temp: &mut [u32],
+    drow: &mut [f32],
+    w: usize,
+    step: usize,
+    row: usize,
+    border: usize,
+    hv_dist: u32,
+    diag_dist: u32,
+    long_dist: u32,
+    dist_max: u32,
+    scale: f32,
+) {
+    let v_hv = _mm512_set1_epi32(hv_dist as i32);
+    let v_diag = _mm512_set1_epi32(diag_dist as i32);
+    let v_long = _mm512_set1_epi32(long_dist as i32);
+    let v_scale = _mm512_set1_ps(scale);
+    let v_max = _mm512_set1_epi32(u32::MAX as i32);
+    // 折叠 ramp：lane k 贡献 (16-k)*hv（后向，从右到左）
+    let v_ramp2 = _mm512_set_epi32(
+        (1 * hv_dist) as i32,
+        (2 * hv_dist) as i32,
+        (3 * hv_dist) as i32,
+        (4 * hv_dist) as i32,
+        (5 * hv_dist) as i32,
+        (6 * hv_dist) as i32,
+        (7 * hv_dist) as i32,
+        (8 * hv_dist) as i32,
+        (9 * hv_dist) as i32,
+        (10 * hv_dist) as i32,
+        (11 * hv_dist) as i32,
+        (12 * hv_dist) as i32,
+        (13 * hv_dist) as i32,
+        (14 * hv_dist) as i32,
+        (15 * hv_dist) as i32,
+        (16 * hv_dist) as i32,
+    );
+    // 扫描 clamp 常量：dist_max - s*hv（避免加法回绕产生假胜出）
+    let v_c1 = _mm512_set1_epi32((dist_max - 1 * hv_dist) as i32);
+    let v_c2 = _mm512_set1_epi32((dist_max - 2 * hv_dist) as i32);
+    let v_c4 = _mm512_set1_epi32((dist_max - 4 * hv_dist) as i32);
+    let v_c8 = _mm512_set1_epi32((dist_max - 8 * hv_dist) as i32);
+    let v_s1 = _mm512_set1_epi32((1 * hv_dist) as i32);
+    let v_s2 = _mm512_set1_epi32((2 * hv_dist) as i32);
+    let v_s4 = _mm512_set1_epi32((4 * hv_dist) as i32);
+    let v_s8 = _mm512_set1_epi32((8 * hv_dist) as i32);
+    // 后缀扫描有效掩码：step s 有效 lane k < 16-s
+    let m1 = (1u16 << 15) - 1;
+    let m2 = (1u16 << 14) - 1;
+    let m4 = (1u16 << 12) - 1;
+    let m8 = (1u16 << 8) - 1;
+
+    let nb = w / 16;
+    let tail = w % 16;
+    let base = tail; // 块覆盖 [tail, w)
+
+    // Phase 1: 局部后缀扫描（块独立，向量化 bot1/bot2 行 min + t0）
+    unsafe {
+        for b in 0..nb {
+            let j = base + 16 * b;
+            let bot1 = temp.as_ptr().add(row + step + border + j - 2);
+            let bot2 = temp.as_ptr().add(row + 2 * step + border + j - 1);
+            let b2m1 = _mm512_loadu_si512(bot2 as *const __m512i);
+            let b2p1 = _mm512_loadu_si512(bot2.add(2) as *const __m512i);
+            let b1m2 = _mm512_loadu_si512(bot1 as *const __m512i);
+            let b1m1 = _mm512_loadu_si512(bot1.add(1) as *const __m512i);
+            let b1 = _mm512_loadu_si512(bot1.add(2) as *const __m512i);
+            let b1p1 = _mm512_loadu_si512(bot1.add(3) as *const __m512i);
+            let b1p2 = _mm512_loadu_si512(bot1.add(4) as *const __m512i);
+            let m = _mm512_min_epu32(
+                _mm512_min_epu32(
+                    _mm512_min_epu32(
+                        _mm512_add_epi32(b2m1, v_long),
+                        _mm512_add_epi32(b2p1, v_long),
+                    ),
+                    _mm512_min_epu32(
+                        _mm512_add_epi32(b1m2, v_long),
+                        _mm512_add_epi32(b1m1, v_diag),
+                    ),
+                ),
+                _mm512_min_epu32(
+                    _mm512_min_epu32(
+                        _mm512_add_epi32(b1, v_hv),
+                        _mm512_add_epi32(b1p1, v_diag),
+                    ),
+                    _mm512_add_epi32(b1p2, v_long),
+                ),
+            );
+            let t0 = _mm512_loadu_si512(temp.as_ptr().add(row + border + j) as *const __m512i);
+            let mut a = _mm512_min_epu32(m, t0);
+            // 后缀扫描：s=1,2,4,8
+            let src = _mm512_alignr_epi32(a, a, 1);
+            let src = _mm512_min_epu32(src, v_c1);
+            let t = _mm512_add_epi32(src, v_s1);
+            a = _mm512_mask_min_epu32(a, m1, a, t);
+            let src = _mm512_alignr_epi32(a, a, 2);
+            let src = _mm512_min_epu32(src, v_c2);
+            let t = _mm512_add_epi32(src, v_s2);
+            a = _mm512_mask_min_epu32(a, m2, a, t);
+            let src = _mm512_alignr_epi32(a, a, 4);
+            let src = _mm512_min_epu32(src, v_c4);
+            let t = _mm512_add_epi32(src, v_s4);
+            a = _mm512_mask_min_epu32(a, m4, a, t);
+            let src = _mm512_alignr_epi32(a, a, 8);
+            let src = _mm512_min_epu32(src, v_c8);
+            let t = _mm512_add_epi32(src, v_s8);
+            a = _mm512_mask_min_epu32(a, m8, a, t);
+            _mm512_storeu_si512(temp.as_mut_ptr().add(row + border + j) as *mut __m512i, a);
+        }
+    }
+
+    // Phase 2+3: 串行 stitch + 折叠 + 定点→浮点（块从右到左，lane0 输出即下一块 incoming）
+    let mut r = temp[row + border + w];
+    unsafe {
+        for b in (0..nb).rev() {
+            let j = base + 16 * b;
+            let local = _mm512_loadu_si512(temp.as_ptr().add(row + border + j) as *const __m512i);
+            let vr = _mm512_set1_epi32(r as i32);
+            let t = _mm512_add_epi32(vr, v_ramp2);
+            let wrap = _mm512_cmplt_epu32_mask(t, vr);
+            let t = _mm512_mask_mov_epi32(t, wrap, v_max);
+            let v = _mm512_min_epu32(local, t);
+            r = _mm512_cvtsi512_si32(v) as u32;
+            _mm512_storeu_si512(temp.as_mut_ptr().add(row + border + j) as *mut __m512i, v);
+            let f = _mm512_mul_ps(_mm512_cvtepi32_ps(v), v_scale);
+            _mm512_storeu_ps(drow.as_mut_ptr().add(j), f);
+        }
+    }
+
+    // 标量尾部（最左 [0, tail) 像素，含 right 依赖）
+    let mut right = temp[row + border + tail];
+    for j in (0..tail).rev() {
+        let idx = row + border + j;
+        let mut t0 = temp[idx];
+        if t0 > hv_dist {
+            let mut t = temp[idx + 2 * step + 1].wrapping_add(long_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx + 2 * step - 1].wrapping_add(long_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx + step + 2].wrapping_add(long_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx + step + 1].wrapping_add(diag_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx + step].wrapping_add(hv_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx + step - 1].wrapping_add(diag_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = temp[idx + step - 2].wrapping_add(long_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            t = right.wrapping_add(hv_dist);
+            if t < t0 {
+                t0 = t;
+            }
+            temp[idx] = t0;
+        }
+        right = temp[idx];
+    }
+    // 尾部定点 → 浮点
+    for j in 0..tail {
+        drow[j] = temp[row + border + j] as f32 * scale;
+    }
+}
+
+/// 3×3 距离变换后向扫描（AVX512，每批 16 像素）。
+///
+/// 向量化 bottom 行 min 计算，标量修复 `right` 依赖（对齐 OpenCV）。
+/// 定点 → 浮点转换向量化。
+///
+/// # Safety
+/// - `temp` 长度 ≥ `(row + step) + border + w + 1`
+/// - `drow` 长度 ≥ `w`
+/// - CPU 需支持 AVX512F/BW/VL
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn dist_backward_3x3(
+    temp: &mut [u32],
+    drow: &mut [f32],
+    w: usize,
+    step: usize,
+    row: usize,
+    border: usize,
+    hv_dist: u32,
+    diag_dist: u32,
+    dist_max: u32,
+    scale: f32,
+) {
+    let v_hv = _mm512_set1_epi32(hv_dist as i32);
+    let v_diag = _mm512_set1_epi32(diag_dist as i32);
+    let v_scale = _mm512_set1_ps(scale);
+    let v_max = _mm512_set1_epi32(u32::MAX as i32);
+    // 折叠 ramp：lane k 贡献 (16-k)*hv（后向，从右到左）
+    let v_ramp2 = _mm512_set_epi32(
+        (1 * hv_dist) as i32,
+        (2 * hv_dist) as i32,
+        (3 * hv_dist) as i32,
+        (4 * hv_dist) as i32,
+        (5 * hv_dist) as i32,
+        (6 * hv_dist) as i32,
+        (7 * hv_dist) as i32,
+        (8 * hv_dist) as i32,
+        (9 * hv_dist) as i32,
+        (10 * hv_dist) as i32,
+        (11 * hv_dist) as i32,
+        (12 * hv_dist) as i32,
+        (13 * hv_dist) as i32,
+        (14 * hv_dist) as i32,
+        (15 * hv_dist) as i32,
+        (16 * hv_dist) as i32,
+    );
+    // 扫描 clamp 常量：dist_max - s*hv（避免加法回绕产生假胜出）
+    let v_c1 = _mm512_set1_epi32((dist_max - 1 * hv_dist) as i32);
+    let v_c2 = _mm512_set1_epi32((dist_max - 2 * hv_dist) as i32);
+    let v_c4 = _mm512_set1_epi32((dist_max - 4 * hv_dist) as i32);
+    let v_c8 = _mm512_set1_epi32((dist_max - 8 * hv_dist) as i32);
+    let v_s1 = _mm512_set1_epi32((1 * hv_dist) as i32);
+    let v_s2 = _mm512_set1_epi32((2 * hv_dist) as i32);
+    let v_s4 = _mm512_set1_epi32((4 * hv_dist) as i32);
+    let v_s8 = _mm512_set1_epi32((8 * hv_dist) as i32);
+    // 后缀扫描有效掩码：step s 有效 lane k < 16-s
+    let m1 = (1u16 << 15) - 1;
+    let m2 = (1u16 << 14) - 1;
+    let m4 = (1u16 << 12) - 1;
+    let m8 = (1u16 << 8) - 1;
+
+    let nb = w / 16;
+    let tail = w % 16;
+    let base = tail; // 块覆盖 [tail, w)
+
+    // Phase 1: 局部后缀扫描（块独立，向量化 bottom 行 min + t0）
+    unsafe {
+        for b in 0..nb {
+            let j = base + 16 * b;
+            let bottom = temp.as_ptr().add(row + step + border + j - 1);
+            let bl = _mm512_loadu_si512(bottom as *const __m512i);
+            let b = _mm512_loadu_si512(bottom.add(1) as *const __m512i);
+            let br = _mm512_loadu_si512(bottom.add(2) as *const __m512i);
+            let m = _mm512_min_epu32(
+                _mm512_min_epu32(
+                    _mm512_add_epi32(bl, v_diag),
+                    _mm512_add_epi32(b, v_hv),
+                ),
+                _mm512_add_epi32(br, v_diag),
+            );
+            let t0 = _mm512_loadu_si512(temp.as_ptr().add(row + border + j) as *const __m512i);
+            let mut a = _mm512_min_epu32(m, t0);
+            // 后缀扫描：s=1,2,4,8
+            let src = _mm512_alignr_epi32(a, a, 1);
+            let src = _mm512_min_epu32(src, v_c1);
+            let t = _mm512_add_epi32(src, v_s1);
+            a = _mm512_mask_min_epu32(a, m1, a, t);
+            let src = _mm512_alignr_epi32(a, a, 2);
+            let src = _mm512_min_epu32(src, v_c2);
+            let t = _mm512_add_epi32(src, v_s2);
+            a = _mm512_mask_min_epu32(a, m2, a, t);
+            let src = _mm512_alignr_epi32(a, a, 4);
+            let src = _mm512_min_epu32(src, v_c4);
+            let t = _mm512_add_epi32(src, v_s4);
+            a = _mm512_mask_min_epu32(a, m4, a, t);
+            let src = _mm512_alignr_epi32(a, a, 8);
+            let src = _mm512_min_epu32(src, v_c8);
+            let t = _mm512_add_epi32(src, v_s8);
+            a = _mm512_mask_min_epu32(a, m8, a, t);
+            _mm512_storeu_si512(temp.as_mut_ptr().add(row + border + j) as *mut __m512i, a);
+        }
+    }
+
+    // Phase 2+3: 串行 stitch + 折叠 + 定点→浮点（块从右到左，lane0 输出即下一块 incoming）
+    let mut r = temp[row + border + w];
+    unsafe {
+        for b in (0..nb).rev() {
+            let j = base + 16 * b;
+            let local = _mm512_loadu_si512(temp.as_ptr().add(row + border + j) as *const __m512i);
+            let vr = _mm512_set1_epi32(r as i32);
+            let t = _mm512_add_epi32(vr, v_ramp2);
+            let wrap = _mm512_cmplt_epu32_mask(t, vr);
+            let t = _mm512_mask_mov_epi32(t, wrap, v_max);
+            let v = _mm512_min_epu32(local, t);
+            r = _mm512_cvtsi512_si32(v) as u32;
+            _mm512_storeu_si512(temp.as_mut_ptr().add(row + border + j) as *mut __m512i, v);
+            let f = _mm512_mul_ps(_mm512_cvtepi32_ps(v), v_scale);
+            _mm512_storeu_ps(drow.as_mut_ptr().add(j), f);
+        }
+    }
+
+    // 标量尾部（最左 [0, tail) 像素，含 right 依赖）
+    let mut right = temp[row + border + tail];
+    for j in (0..tail).rev() {
+        let idx = row + border + j;
+        let t0 = temp[idx];
+        if t0 > hv_dist {
+            let b1 = temp[idx + step + 1].wrapping_add(diag_dist);
+            let b2 = temp[idx + step].wrapping_add(hv_dist);
+            let b3 = temp[idx + step - 1].wrapping_add(diag_dist);
+            let r = right.wrapping_add(hv_dist);
+            let mut t = b1.min(b2);
+            t = t.min(b3);
+            t = t.min(r);
+            if t < t0 {
+                temp[idx] = t;
+            }
+        }
+        right = temp[idx];
+    }
+    // 尾部定点 → 浮点
+    for j in 0..tail {
+        drow[j] = temp[row + border + j] as f32 * scale;
+    }
+}
+
+// ==================== cvtColor（RGB2YCrCb / YCrCb2RGB） ====================
+
+/// RGB u8 → YCrCb u8（AVX512，每批 64 像素）。
+///
+/// 对齐 OpenCV `RGB2YCrCb_i<uchar>` SIMD 路径。公式（RGB 输入，blueIdx=0）：
+///   y  = (R*4899 + G*9617 + B*1868 + 8192) >> 14
+///   cr = ((R - y)*11682 + 2105344) >> 14
+///   cb = ((B - y)*9241  + 2105344) >> 14
+///
+/// # Safety
+/// - `src` 长度 ≥ `n*3`，`dst` 长度 ≥ `n*3`
+/// - 调用方需保证 CPU 支持 AVX512F/BW/VL
+#[inline(never)]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn rgb_to_ycrcb(src: &[u8], dst: &mut [u8], n: usize) {
+    // SAFETY: 循环条件 i+64 <= n 保证读写界内；AVX512 由调用方保证
+    unsafe {
+        let mut i = 0;
+        while i + 64 <= n {
+            // 两个 32 像素块解交织（复用 AVX2）
+            let (r0, g0, b0) = avx2::deinterleave3(
+                _mm256_loadu_si256(src.as_ptr().add(i * 3) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 32) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 64) as *const __m256i),
+            );
+            let (r1, g1, b1) = avx2::deinterleave3(
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 96) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 128) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 160) as *const __m256i),
+            );
+            let (y0, cr0, cb0) = rgb2ycrcb_64(b0, g0, r0);
+            let (y1, cr1, cb1) = rgb2ycrcb_64(b1, g1, r1);
+            // 交织存储 YCrCb（两个 32 像素块）
+            let o0 = avx2::interleave3(y0, cr0, cb0);
+            let o1 = avx2::interleave3(y1, cr1, cb1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3) as *mut __m256i, o0.0);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 32) as *mut __m256i, o0.1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 64) as *mut __m256i, o0.2);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 96) as *mut __m256i, o1.0);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 128) as *mut __m256i, o1.1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 160) as *mut __m256i, o1.2);
+            i += 64;
+        }
+        // 剩余用 AVX2
+        avx2::rgb_to_ycrcb(&src[i * 3..], &mut dst[i * 3..], n - i);
+    }
+}
+
+/// 32×u8 通道 → YCrCb（AVX512，`_mm512_madd_epi16` 点积）。
+#[inline]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+unsafe fn rgb2ycrcb_64(b: __m256i, g: __m256i, r: __m256i) -> (__m256i, __m256i, __m256i) {
+    // SAFETY: 调用方保证 AVX512；纯向量运算
+    unsafe {
+        // 零扩展 u8 → u16（32 个）
+        let b0 = _mm512_cvtepu8_epi16(b);
+        let g0 = _mm512_cvtepu8_epi16(g);
+        let r0 = _mm512_cvtepu8_epi16(r);
+
+        // 交织 B/G 和 R/descale
+        let (bg00, bg01) = v_zip(b0, g0);
+        let (rd00, rd01) = v_zip(r0, DESCALE);
+
+        // y = (B*1868 + G*9617 + R*4899 + 8192) >> 14
+        let y00 = _mm512_srli_epi32(
+            _mm512_add_epi32(_mm512_madd_epi16(bg00, YC_BG2Y), _mm512_madd_epi16(rd00, YC_R12Y)),
+            14,
+        );
+        let y01 = _mm512_srli_epi32(
+            _mm512_add_epi32(_mm512_madd_epi16(bg01, YC_BG2Y), _mm512_madd_epi16(rd01, YC_R12Y)),
+            14,
+        );
+        let y0 = pack_u32_to_u16(y00, y01);
+
+        // (r - y) 和 (b - y)，i16
+        let sr0 = _mm512_sub_epi16(r0, y0);
+        let sb0 = _mm512_sub_epi16(b0, y0);
+
+        // cr = ((r-y)*11682 + 2105344) >> 14
+        let (rd00, rd01) = v_zip(sr0, DESCALE);
+        let cr00 = _mm512_srli_epi32(_mm512_madd_epi16(rd00, YC_C3H), 14);
+        let cr01 = _mm512_srli_epi32(_mm512_madd_epi16(rd01, YC_C3H), 14);
+        let cr0 = pack_u32_to_u16(cr00, cr01);
+
+        // cb = ((b-y)*9241 + 2105344) >> 14
+        let (bd00, bd01) = v_zip(sb0, DESCALE);
+        let cb00 = _mm512_srli_epi32(_mm512_madd_epi16(bd00, YC_C4H), 14);
+        let cb01 = _mm512_srli_epi32(_mm512_madd_epi16(bd01, YC_C4H), 14);
+        let cb0 = pack_u32_to_u16(cb00, cb01);
+
+        // 饱和打包 u16 → u8
+        let y = pack_u16_to_u8(y0);
+        let cr = pack_u16_to_u8(cr0);
+        let cb = pack_u16_to_u8(cb0);
+        (y, cr, cb)
+    }
+}
+
+/// YCrCb u8 → RGB u8（AVX512，每批 64 像素）。
+///
+/// 对齐 OpenCV `YCrCb2RGB_i<uchar>` SIMD 路径。公式（YCrCb 输入，blueIdx=0）：
+///   b = Y + ((Cb-128)*29049 + 8192) >> 14
+///   g = Y + ((Cb-128)*(-5636) + (Cr-128)*(-11698) + 8192) >> 14
+///   r = Y + ((Cr-128)*22987 + 8192) >> 14
+///
+/// # Safety
+/// - `src` 长度 ≥ `n*3`，`dst` 长度 ≥ `n*3`
+/// - 调用方需保证 CPU 支持 AVX512F/BW/VL
+#[inline(never)]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn ycrcb_to_rgb(src: &[u8], dst: &mut [u8], n: usize) {
+    // SAFETY: 循环条件 i+64 <= n 保证读写界内；AVX512 由调用方保证
+    unsafe {
+        let mut i = 0;
+        while i + 64 <= n {
+            let (y0, cr0, cb0) = avx2::deinterleave3(
+                _mm256_loadu_si256(src.as_ptr().add(i * 3) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 32) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 64) as *const __m256i),
+            );
+            let (y1, cr1, cb1) = avx2::deinterleave3(
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 96) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 128) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 160) as *const __m256i),
+            );
+            let (r0, g0, b0) = ycrcb2rgb_64(y0, cr0, cb0);
+            let (r1, g1, b1) = ycrcb2rgb_64(y1, cr1, cb1);
+            let o0 = avx2::interleave3(r0, g0, b0);
+            let o1 = avx2::interleave3(r1, g1, b1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3) as *mut __m256i, o0.0);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 32) as *mut __m256i, o0.1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 64) as *mut __m256i, o0.2);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 96) as *mut __m256i, o1.0);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 128) as *mut __m256i, o1.1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 160) as *mut __m256i, o1.2);
+            i += 64;
+        }
+        // 剩余用 AVX2
+        avx2::ycrcb_to_rgb(&src[i * 3..], &mut dst[i * 3..], n - i);
+    }
+}
+
+/// 32×u8 YCrCb 通道 → RGB（AVX512）。
+#[inline]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+unsafe fn ycrcb2rgb_64(y: __m256i, cr: __m256i, cb: __m256i) -> (__m256i, __m256i, __m256i) {
+    // SAFETY: 调用方保证 AVX512；纯向量运算
+    unsafe {
+        // cr/cb 减 128（有符号）
+        let cr = _mm256_sub_epi8(cr, DELTA8);
+        let cb = _mm256_sub_epi8(cb, DELTA8);
+        // 符号扩展 i8 → i16（32 个）
+        let cr0 = _mm512_cvtepi8_epi16(cr);
+        let cb0 = _mm512_cvtepi8_epi16(cb);
+
+        // b = (Cb-128)*29049
+        let (b00, b01) = v_mul_expand(cb0, YC_VC3);
+        // g = (Cb-128)*(-5636) + (Cr-128)*(-11698)
+        let (t00, t01) = v_mul_expand(cb0, YC_VC2);
+        let (g00, g01) = v_mul_expand(cr0, YC_VC1);
+        let g00 = _mm512_add_epi32(g00, t00);
+        let g01 = _mm512_add_epi32(g01, t01);
+        // r = (Cr-128)*22987
+        let (r00, r01) = v_mul_expand(cr0, YC_VC0);
+
+        // + descale >> 14
+        let b00 = _mm512_srai_epi32(_mm512_add_epi32(b00, DESCALE32), 14);
+        let b01 = _mm512_srai_epi32(_mm512_add_epi32(b01, DESCALE32), 14);
+        let g00 = _mm512_srai_epi32(_mm512_add_epi32(g00, DESCALE32), 14);
+        let g01 = _mm512_srai_epi32(_mm512_add_epi32(g01, DESCALE32), 14);
+        let r00 = _mm512_srai_epi32(_mm512_add_epi32(r00, DESCALE32), 14);
+        let r01 = _mm512_srai_epi32(_mm512_add_epi32(r01, DESCALE32), 14);
+
+        // 打包 i32 → i16
+        let b0 = pack_i32_to_i16(b00, b01);
+        let g0 = pack_i32_to_i16(g00, g01);
+        let r0 = pack_i32_to_i16(r00, r01);
+
+        // + Y（i16）
+        let y0 = _mm512_cvtepu8_epi16(y);
+        let b0 = _mm512_add_epi16(b0, y0);
+        let g0 = _mm512_add_epi16(g0, y0);
+        let r0 = _mm512_add_epi16(r0, y0);
+
+        // 饱和打包 i16 → u8
+        let b = pack_i16_to_u8(b0);
+        let g = pack_i16_to_u8(g0);
+        let r = pack_i16_to_u8(r0);
+        (r, g, b)
+    }
+}
+
+/// `v_mul_expand`（i16 × i16 → i32 对，AVX512）。
+#[inline]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+unsafe fn v_mul_expand(a: __m512i, b: __m512i) -> (__m512i, __m512i) {
+    // SAFETY: 调用方保证 AVX512；纯向量运算
+    unsafe {
+        let lo = _mm512_mullo_epi16(a, b);
+        let hi = _mm512_mulhi_epi16(a, b);
+        v_zip(lo, hi)
+    }
+}
+
+/// i32 → i16 饱和打包（`v_pack`，AVX512）。
+#[inline]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+unsafe fn pack_i32_to_i16(a: __m512i, b: __m512i) -> __m512i {
+    // SAFETY: 调用方保证 AVX512；纯向量运算
+    unsafe {
+        let lo = _mm512_cvtepi32_epi16(a);
+        let hi = _mm512_cvtepi32_epi16(b);
+        _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1)
+    }
+}
+
+/// i16 → u8 饱和打包（`v_pack_u`，AVX512）。
+#[inline]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+unsafe fn pack_i16_to_u8(a: __m512i) -> __m256i {
+    // SAFETY: 调用方保证 AVX512；纯向量运算
+    // _mm512_cvtepi16_epi8 是截断，需先饱和到 [0,255]
+    unsafe {
+        let a = _mm512_max_epi16(a, _mm512_setzero_si512());
+        let a = _mm512_min_epi16(a, _mm512_set1_epi16(255));
+        _mm512_cvtepi16_epi8(a)
+    }
+}
+
+// ---- cvtColor 常量向量 ----
+static DESCALE: __m512i = unsafe { std::mem::transmute::<[i16; 32], __m512i>([8192; 32]) };
+static DESCALE32: __m512i = unsafe { std::mem::transmute::<[i32; 16], __m512i>([8192; 16]) };
+static DELTA8: __m256i = unsafe { std::mem::transmute::<[i8; 32], __m256i>([-128; 32]) };
+// bg2y = [B2Y, G2Y] 交织 = [1868, 9617]
+static YC_BG2Y: __m512i = unsafe {
+    std::mem::transmute::<[i16; 32], __m512i>([
+        1868, 9617, 1868, 9617, 1868, 9617, 1868, 9617, 1868, 9617, 1868, 9617, 1868, 9617, 1868,
+        9617, 1868, 9617, 1868, 9617, 1868, 9617, 1868, 9617, 1868, 9617, 1868, 9617, 1868, 9617,
+        1868, 9617,
+    ])
+};
+// r12y = [R2Y, 1] 交织 = [4899, 1]
+static YC_R12Y: __m512i = unsafe {
+    std::mem::transmute::<[i16; 32], __m512i>([
+        4899, 1, 4899, 1, 4899, 1, 4899, 1, 4899, 1, 4899, 1, 4899, 1, 4899, 1, 4899, 1, 4899, 1,
+        4899, 1, 4899, 1, 4899, 1, 4899, 1, 4899, 1, 4899, 1,
+    ])
+};
+// c3h = [YCRI, h21] = [11682, 257]
+static YC_C3H: __m512i = unsafe {
+    std::mem::transmute::<[i16; 32], __m512i>([
+        11682, 257, 11682, 257, 11682, 257, 11682, 257, 11682, 257, 11682, 257, 11682, 257, 11682,
+        257, 11682, 257, 11682, 257, 11682, 257, 11682, 257, 11682, 257, 11682, 257, 11682, 257,
+        11682, 257,
+    ])
+};
+// c4h = [YCBI, h21] = [9241, 257]
+static YC_C4H: __m512i = unsafe {
+    std::mem::transmute::<[i16; 32], __m512i>([
+        9241, 257, 9241, 257, 9241, 257, 9241, 257, 9241, 257, 9241, 257, 9241, 257, 9241, 257,
+        9241, 257, 9241, 257, 9241, 257, 9241, 257, 9241, 257, 9241, 257, 9241, 257, 9241, 257,
+    ])
+};
+// YCrCb2RGB 系数
+static YC_VC0: __m512i = unsafe { std::mem::transmute::<[i16; 32], __m512i>([22987; 32]) };
+static YC_VC1: __m512i = unsafe { std::mem::transmute::<[i16; 32], __m512i>([-11698; 32]) };
+static YC_VC2: __m512i = unsafe { std::mem::transmute::<[i16; 32], __m512i>([-5636; 32]) };
+static YC_VC3: __m512i = unsafe { std::mem::transmute::<[i16; 32], __m512i>([29049; 32]) };
+
+// ==================== cvtColor（RGB2HSV） ====================
+
+/// RGB u8 → HSV u8（AVX512，每批 64 像素）。
+///
+/// 对齐 OpenCV `RGB2HSV_b` SIMD 路径（color_hsv.simd.hpp:88-232）。
+/// 整数定点（HSV_SHIFT=12），用 gather 查找表 sdiv/hdiv。
+///
+/// # Safety
+/// - `src` 长度 ≥ `n*3`，`dst` 长度 ≥ `n*3`
+/// - 调用方需保证 CPU 支持 AVX512F/BW/VL
+#[inline(never)]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn rgb_to_hsv(src: &[u8], dst: &mut [u8], n: usize, hrange: i32) {
+    // SAFETY: 循环条件 i+64 <= n 保证读写界内；AVX512 由调用方保证
+    unsafe {
+        let sdiv = crate::imgproc::cvt_color::hsv_sdiv_table();
+        let hdiv = crate::imgproc::cvt_color::hsv_hdiv_table(hrange);
+        let mut i = 0;
+        while i + 64 <= n {
+            // 两个 32 像素块解交织（复用 AVX2）
+            let (r0, g0, b0) = avx2::deinterleave3(
+                _mm256_loadu_si256(src.as_ptr().add(i * 3) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 32) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 64) as *const __m256i),
+            );
+            let (r1, g1, b1) = avx2::deinterleave3(
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 96) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 128) as *const __m256i),
+                _mm256_loadu_si256(src.as_ptr().add(i * 3 + 160) as *const __m256i),
+            );
+            let (h0, s0, v0) = rgb2hsv_32(r0, g0, b0, &sdiv, &hdiv, hrange);
+            let (h1, s1, v1) = rgb2hsv_32(r1, g1, b1, &sdiv, &hdiv, hrange);
+            let o0 = avx2::interleave3(h0, s0, v0);
+            let o1 = avx2::interleave3(h1, s1, v1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3) as *mut __m256i, o0.0);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 32) as *mut __m256i, o0.1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 64) as *mut __m256i, o0.2);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 96) as *mut __m256i, o1.0);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 128) as *mut __m256i, o1.1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i * 3 + 160) as *mut __m256i, o1.2);
+            i += 64;
+        }
+        // 剩余用 AVX2
+        avx2::rgb_to_hsv(&src[i * 3..], &mut dst[i * 3..], n - i, hrange);
+    }
+}
+
+/// 32×u8 RGB 通道 → HSV（AVX512，gather 查找表 + 整数定点）。
+#[inline]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+unsafe fn rgb2hsv_32(
+    r: __m256i,
+    g: __m256i,
+    b: __m256i,
+    sdiv: &[i32; 256],
+    hdiv: &[i32; 256],
+    hrange: i32,
+) -> (__m256i, __m256i, __m256i) {
+    // SAFETY: 调用方保证 AVX512；纯向量运算
+    unsafe {
+        // v = max(r, g, b), vmin = min(r, g, b)
+        let v = _mm256_max_epu8(r, _mm256_max_epu8(g, b));
+        let vmin = _mm256_min_epu8(r, _mm256_min_epu8(g, b));
+        let diff = _mm256_sub_epi8(v, vmin);
+
+        // vr = (v == r) ? 0xFF : 0, vg = (v == g) ? 0xFF : 0
+        let vr = _mm256_cmpeq_epi8(v, r);
+        let vg = _mm256_cmpeq_epi8(v, g);
+
+        // 展开 v 到 i32（分低/高 16 像素）
+        let v_lo = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(v));
+        let v_hi = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(v, 1));
+        // gather sdiv[v]
+        let sdiv_lo = _mm512_i32gather_epi32(v_lo, sdiv.as_ptr(), 4);
+        let sdiv_hi = _mm512_i32gather_epi32(v_hi, sdiv.as_ptr(), 4);
+
+        // 展开 diff 到 i32
+        let diff_lo = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(diff));
+        let diff_hi = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(diff, 1));
+        // gather hdiv[diff]
+        let hdiv_lo = _mm512_i32gather_epi32(diff_lo, hdiv.as_ptr(), 4);
+        let hdiv_hi = _mm512_i32gather_epi32(diff_hi, hdiv.as_ptr(), 4);
+
+        // s = (diff * sdiv[v] + 2048) >> 12
+        let descale = _mm512_set1_epi32(2048);
+        let sq_lo = _mm512_srai_epi32(_mm512_add_epi32(_mm512_mullo_epi32(diff_lo, sdiv_lo), descale), 12);
+        let sq_hi = _mm512_srai_epi32(_mm512_add_epi32(_mm512_mullo_epi32(diff_hi, sdiv_hi), descale), 12);
+        let s = pack_i32_to_u8(sq_lo, sq_hi);
+
+        // 展开 r, g, b, diff 到 i16（32 个）
+        let r0 = _mm512_cvtepu8_epi16(r);
+        let g0 = _mm512_cvtepu8_epi16(g);
+        let b0 = _mm512_cvtepu8_epi16(b);
+        let diff0 = _mm512_cvtepu8_epi16(diff);
+
+        // vr/vg 符号扩展 i8 → i16（32 个）
+        let vr0 = _mm512_cvtepi8_epi16(vr);
+        let vg0 = _mm512_cvtepi8_epi16(vg);
+
+        // h = (vr & (g - b)) + (~vr & ((vg & (b - r + 2*diff)) + ((~vg) & (r - g + 4*diff))))
+        let hd = h_before_div(r0, g0, b0, diff0, vr0, vg0);
+
+        // 展开 hd 到 i32（分低/高 16 个）
+        let hq_lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(hd));
+        let hq_hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(hd, 1));
+
+        // h = (h * hdiv[diff] + 2048) >> 12
+        let hq_lo = _mm512_srai_epi32(_mm512_add_epi32(_mm512_mullo_epi32(hq_lo, hdiv_lo), descale), 12);
+        let hq_hi = _mm512_srai_epi32(_mm512_add_epi32(_mm512_mullo_epi32(hq_hi, hdiv_hi), descale), 12);
+
+        // h = h < 0 ? h + hrange : h
+        let vhr = _mm512_set1_epi32(hrange);
+        let hq_lo = _mm512_add_epi32(hq_lo, _mm512_maskz_mov_epi32(_mm512_cmpgt_epi32_mask(_mm512_setzero_si512(), hq_lo), vhr));
+        let hq_hi = _mm512_add_epi32(hq_hi, _mm512_maskz_mov_epi32(_mm512_cmpgt_epi32_mask(_mm512_setzero_si512(), hq_hi), vhr));
+
+        let h = pack_i32_to_u8(hq_lo, hq_hi);
+
+        (h, s, v)
+    }
+}
+
+/// h 除法前的计算（i16，AVX512）。
+#[inline]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+unsafe fn h_before_div(
+    r: __m512i,
+    g: __m512i,
+    b: __m512i,
+    diff: __m512i,
+    vr: __m512i,
+    vg: __m512i,
+) -> __m512i {
+    // SAFETY: 调用方保证 AVX512；纯向量运算
+    unsafe {
+        let gb = _mm512_sub_epi16(g, b);
+        let br = _mm512_add_epi16(_mm512_sub_epi16(b, r), _mm512_slli_epi16(diff, 1));
+        let rg = _mm512_add_epi16(_mm512_sub_epi16(r, g), _mm512_slli_epi16(diff, 2));
+        let not_vr = _mm512_xor_si512(vr, _mm512_set1_epi16(-1));
+        let not_vg = _mm512_xor_si512(vg, _mm512_set1_epi16(-1));
+        let inner = _mm512_add_epi16(
+            _mm512_and_si512(vg, br),
+            _mm512_and_si512(not_vg, rg),
+        );
+        _mm512_add_epi16(
+            _mm512_and_si512(vr, gb),
+            _mm512_and_si512(not_vr, inner),
+        )
+    }
+}
+
+/// i32 → u8 饱和打包（AVX512，`v_pack_u`）。
+#[inline]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+unsafe fn pack_i32_to_u8(a: __m512i, b: __m512i) -> __m256i {
+    // SAFETY: 调用方保证 AVX512；纯向量运算
+    unsafe {
+        let a = _mm512_max_epi32(a, _mm512_setzero_si512());
+        let a = _mm512_min_epi32(a, _mm512_set1_epi32(255));
+        let b = _mm512_max_epi32(b, _mm512_setzero_si512());
+        let b = _mm512_min_epi32(b, _mm512_set1_epi32(255));
+        let lo = _mm512_cvtepi32_epi8(a);
+        let hi = _mm512_cvtepi32_epi8(b);
+        _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1)
+    }
+}
+
+/// 4×i32 → u8 饱和打包（AVX512，`v_pack_u`）。
+#[inline]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+unsafe fn pack_i32_to_u8_4(a: __m512i, b: __m512i, c: __m512i, d: __m512i) -> __m256i {
+    // SAFETY: 调用方保证 AVX512；纯向量运算
+    unsafe {
+        let a = _mm512_max_epi32(a, _mm512_setzero_si512());
+        let a = _mm512_min_epi32(a, _mm512_set1_epi32(255));
+        let b = _mm512_max_epi32(b, _mm512_setzero_si512());
+        let b = _mm512_min_epi32(b, _mm512_set1_epi32(255));
+        let c = _mm512_max_epi32(c, _mm512_setzero_si512());
+        let c = _mm512_min_epi32(c, _mm512_set1_epi32(255));
+        let d = _mm512_max_epi32(d, _mm512_setzero_si512());
+        let d = _mm512_min_epi32(d, _mm512_set1_epi32(255));
+        let lo = _mm512_cvtepi32_epi8(a);
+        let hi = _mm512_cvtepi32_epi8(b);
+        let lo2 = _mm512_cvtepi32_epi8(c);
+        let hi2 = _mm512_cvtepi32_epi8(d);
+        let lo = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+        let hi = _mm256_inserti128_si256(_mm256_castsi128_si256(lo2), hi2, 1);
+        _mm256_inserti128_si256(lo, _mm256_castsi256_si128(hi), 1)
+    }
+}
+
+// ==================== 直方图（histogram） ====================
+
+/// 8U 直方图（AVX512，查找表 + 局部累加，与 OpenCV `calcHist_8u` 一致）。
+///
+/// `src` 为灰度像素，`n` 为像素数，`hist` 长度 ≥ `hist_size`，`tab` 为 256 项查找表。
+///
+/// # Safety
+/// - `src` 长度 ≥ `n`，`hist` 长度 ≥ `hist_size`
+/// - 调用方需保证 CPU 支持 AVX512F/BW/VL
+#[inline(never)]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn calc_hist_8u(src: &[u8], n: usize, hist: &mut [i32], tab: &[usize; 256]) {
+    // SAFETY: 循环条件 i+8 <= n 保证读写界内；AVX512 由调用方保证
+    unsafe {
+        let mut mat_h = [0i32; 256];
+        let mut i = 0;
+        while i + 8 <= n {
+            let t0 = *src.get_unchecked(i) as usize;
+            let t1 = *src.get_unchecked(i + 1) as usize;
+            let t2 = *src.get_unchecked(i + 2) as usize;
+            let t3 = *src.get_unchecked(i + 3) as usize;
+            let t4 = *src.get_unchecked(i + 4) as usize;
+            let t5 = *src.get_unchecked(i + 5) as usize;
+            let t6 = *src.get_unchecked(i + 6) as usize;
+            let t7 = *src.get_unchecked(i + 7) as usize;
+            *mat_h.get_unchecked_mut(t0) += 1;
+            *mat_h.get_unchecked_mut(t1) += 1;
+            *mat_h.get_unchecked_mut(t2) += 1;
+            *mat_h.get_unchecked_mut(t3) += 1;
+            *mat_h.get_unchecked_mut(t4) += 1;
+            *mat_h.get_unchecked_mut(t5) += 1;
+            *mat_h.get_unchecked_mut(t6) += 1;
+            *mat_h.get_unchecked_mut(t7) += 1;
+            i += 8;
+        }
+        while i < n {
+            *mat_h.get_unchecked_mut(*src.get_unchecked(i) as usize) += 1;
+            i += 1;
+        }
+        for (j, &c) in mat_h.iter().enumerate() {
+            let hidx = *tab.get_unchecked(j);
+            if hidx != usize::MAX {
+                *hist.get_unchecked_mut(hidx) += c;
+            }
+        }
+    }
+}
+
+/// 应用 LUT（AVX512，gather 查找表）。
+///
+/// `src` 为灰度像素，`dst` 为输出，`n` 为像素数，`lut` 为 256 项映射表。
+///
+/// # Safety
+/// - `src` 长度 ≥ `n`，`dst` 长度 ≥ `n`
+/// - 调用方需保证 CPU 支持 AVX512F/BW/VL
+#[inline(never)]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn apply_lut(src: &[u8], dst: &mut [u8], n: usize, lut: &[u8; 256]) {
+    // SAFETY: 循环条件 i+64 <= n 保证读写界内；AVX512 由调用方保证
+    unsafe {
+        // 把 u8 LUT 展开为 i32（每项 4 字节），供 gather 使用
+        let mut lut_i32 = [0i32; 256];
+        for (i, &v) in lut.iter().enumerate() {
+            lut_i32[i] = v as i32;
+        }
+        let lut_ptr = lut_i32.as_ptr();
+        let mut i = 0;
+        while i + 64 <= n {
+            // 加载 64 个源像素（两个 32 字节块）
+            let v0 = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+            let v1 = _mm256_loadu_si256(src.as_ptr().add(i + 32) as *const __m256i);
+            // 展开到 i32（每块分低/高 16 个）
+            let lo0 = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(v0));
+            let hi0 = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(v0, 1));
+            let lo1 = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(v1));
+            let hi1 = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(v1, 1));
+            // gather 4 组（scale=4，i32 元素）
+            let g0 = _mm512_i32gather_epi32(lo0, lut_ptr, 4);
+            let g1 = _mm512_i32gather_epi32(hi0, lut_ptr, 4);
+            let g2 = _mm512_i32gather_epi32(lo1, lut_ptr, 4);
+            let g3 = _mm512_i32gather_epi32(hi1, lut_ptr, 4);
+            // 4×16 i32 → 64 u8
+            let g0 = _mm512_max_epi32(g0, _mm512_setzero_si512());
+            let g0 = _mm512_min_epi32(g0, _mm512_set1_epi32(255));
+            let g1 = _mm512_max_epi32(g1, _mm512_setzero_si512());
+            let g1 = _mm512_min_epi32(g1, _mm512_set1_epi32(255));
+            let g2 = _mm512_max_epi32(g2, _mm512_setzero_si512());
+            let g2 = _mm512_min_epi32(g2, _mm512_set1_epi32(255));
+            let g3 = _mm512_max_epi32(g3, _mm512_setzero_si512());
+            let g3 = _mm512_min_epi32(g3, _mm512_set1_epi32(255));
+            let o0 = _mm512_cvtepi32_epi8(g0);
+            let o1 = _mm512_cvtepi32_epi8(g1);
+            let o2 = _mm512_cvtepi32_epi8(g2);
+            let o3 = _mm512_cvtepi32_epi8(g3);
+            let o0 = _mm256_inserti128_si256(_mm256_castsi128_si256(o0), o1, 1);
+            let o1 = _mm256_inserti128_si256(_mm256_castsi128_si256(o2), o3, 1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, o0);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i + 32) as *mut __m256i, o1);
+            i += 64;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) = *lut.get_unchecked(*src.get_unchecked(i) as usize);
+            i += 1;
+        }
     }
 }

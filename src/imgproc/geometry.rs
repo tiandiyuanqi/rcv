@@ -7,7 +7,6 @@
 //! - `min_enclosing_circle`：对齐 shapedescr.cpp:133（Welzl + cv::RNG 复刻）
 
 use crate::core::point::Point;
-use crate::imgproc::contours::contour_area;
 
 /// 旋转矩形，对应 `cv::RotatedRect`（angle 单位度，OpenCV 约定 [-90, 0)）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -257,8 +256,8 @@ pub fn convex_hull(points: &[Point], clockwise: bool) -> Vec<usize> {
             }
         }
         if !break_early {
-            let mmdist = (max_idx as i32 - min_idx as i32).abs() as usize;
-            if (mmdist == 1 || mmdist == nout - 1) && (lt <= 1 || lt >= nout as i32 - 2) {
+            let mmdist = (max_idx as i32 - min_idx as i32).unsigned_abs();
+            if (mmdist as usize == 1 || mmdist as usize == nout - 1) && (lt <= 1 || lt >= nout as i32 - 2) {
                 let ascending = (max_idx + 1) % nout == min_idx;
                 let i0 = if ascending { min_idx } else { max_idx };
                 let mut j = i0;
@@ -340,7 +339,9 @@ fn rotating_calipers(points: &[(f32, f32)], n: usize, orientation: f32, out: &mu
     let mut top = 0usize;
     let mut seq = [0usize; 4];
 
-    let mut base_a;
+    #[allow(unused_assignments)]
+    let mut base_a = 0f32;
+    #[allow(unused_assignments)]
     let mut base_b = 0f32;
 
     let mut pt0 = points[0];
@@ -390,7 +391,10 @@ fn rotating_calipers(points: &[(f32, f32)], n: usize, orientation: f32, out: &mu
             ay = by;
         }
     }
-    base_a = orientation;
+    #[allow(unused_assignments)]
+    {
+        base_a = orientation;
+    }
 
     seq[0] = bottom;
     seq[1] = right;
@@ -708,6 +712,150 @@ pub fn min_enclosing_circle(points: &[Point]) -> ((f32, f32), f32) {
     (center, radius)
 }
 
+/// 点到多边形距离测试（对齐 `cv::pointPolygonTest`）。
+///
+/// `pt` 为测试点，`measure_dist=true` 返回带符号距离（正=内，负=外，0=边界），
+/// `false` 仅返回符号（1=内，-1=外，0=边界）。
+/// 空轮廓：`measure_dist` 时返回 `-f64::MAX`，否则返回 `-1`。
+pub fn point_polygon_test(contour: &[Point], pt: (f32, f32), measure_dist: bool) -> f64 {
+    let total = contour.len();
+    let mut result = 0.0f64;
+    let mut counter = 0i32;
+    let mut min_dist_num = f32::MAX as f64;
+    let mut min_dist_denom = 1.0f64;
+
+    let ip = Point::new(pt.0.round() as i32, pt.1.round() as i32);
+
+    if total == 0 {
+        return if measure_dist { -f64::MAX } else { -1.0 };
+    }
+
+    // 纯整数快路径：非浮点、非 measureDist、且 pt 为整数坐标
+    if !measure_dist && ip.x as f32 == pt.0 && ip.y as f32 == pt.1 {
+        let mut v0 = Point::new(0, 0);
+        let mut v = contour[total - 1];
+
+        for i in 0..total {
+            v0 = v;
+            v = contour[i];
+
+            if (v0.y <= ip.y && v.y <= ip.y)
+                || (v0.y > ip.y && v.y > ip.y)
+                || (v0.x < ip.x && v.x < ip.x)
+            {
+                if ip.y == v.y
+                    && (ip.x == v.x
+                        || (ip.y == v0.y
+                            && ((v0.x <= ip.x && ip.x <= v.x)
+                                || (v.x <= ip.x && ip.x <= v0.x))))
+                {
+                    return 0.0;
+                }
+                continue;
+            }
+
+            let dist = (ip.y as i64 - v0.y as i64) * (v.x as i64 - v0.x as i64)
+                - (ip.x as i64 - v0.x as i64) * (v.y as i64 - v0.y as i64);
+            if dist == 0 {
+                return 0.0;
+            }
+            let dist = if v.y < v0.y { -dist } else { dist };
+            counter += (dist > 0) as i32;
+        }
+
+        result = if counter % 2 == 0 { -1.0 } else { 1.0 };
+    } else {
+        let mut v0 = (0.0f32, 0.0f32);
+        let mut v = (contour[total - 1].x as f32, contour[total - 1].y as f32);
+
+        if !measure_dist {
+            for i in 0..total {
+                let mut dist: f64;
+                v0 = v;
+                v = (contour[i].x as f32, contour[i].y as f32);
+
+                if (v0.1 <= pt.1 && v.1 <= pt.1)
+                    || (v0.1 > pt.1 && v.1 > pt.1)
+                    || (v0.0 < pt.0 && v.0 < pt.0)
+                {
+                    if pt.1 == v.1
+                        && (pt.0 == v.0
+                            || (pt.1 == v0.1
+                                && ((v0.0 <= pt.0 && pt.0 <= v.0)
+                                    || (v.0 <= pt.0 && pt.0 <= v0.0))))
+                    {
+                        return 0.0;
+                    }
+                    continue;
+                }
+
+                dist = (pt.1 as f64 - v0.1 as f64) * (v.0 as f64 - v0.0 as f64)
+                    - (pt.0 as f64 - v0.0 as f64) * (v.1 as f64 - v0.1 as f64);
+                if dist == 0.0 {
+                    return 0.0;
+                }
+                let dist = if v.1 < v0.1 { -dist } else { dist };
+                counter += (dist > 0.0) as i32;
+            }
+
+            result = if counter % 2 == 0 { -1.0 } else { 1.0 };
+        } else {
+            for i in 0..total {
+                let (dx, dy, dx1, dy1, dx2, dy2);
+                let (mut dist_num, mut dist_denom) = (0.0f64, 1.0f64);
+
+                v0 = v;
+                v = (contour[i].x as f32, contour[i].y as f32);
+
+                dx = v.0 as f64 - v0.0 as f64;
+                dy = v.1 as f64 - v0.1 as f64;
+                dx1 = pt.0 as f64 - v0.0 as f64;
+                dy1 = pt.1 as f64 - v0.1 as f64;
+                dx2 = pt.0 as f64 - v.0 as f64;
+                dy2 = pt.1 as f64 - v.1 as f64;
+
+                if dx1 * dx + dy1 * dy <= 0.0 {
+                    dist_num = dx1 * dx1 + dy1 * dy1;
+                } else if dx2 * dx + dy2 * dy >= 0.0 {
+                    dist_num = dx2 * dx2 + dy2 * dy2;
+                } else {
+                    dist_num = dy1 * dx - dx1 * dy;
+                    dist_num *= dist_num;
+                    dist_denom = dx * dx + dy * dy;
+                }
+
+                if dist_num * min_dist_denom < min_dist_num * dist_denom {
+                    min_dist_num = dist_num;
+                    min_dist_denom = dist_denom;
+                    if min_dist_num == 0.0 {
+                        break;
+                    }
+                }
+
+                if (v0.1 <= pt.1 && v.1 <= pt.1)
+                    || (v0.1 > pt.1 && v.1 > pt.1)
+                    || (v0.0 < pt.0 && v.0 < pt.0)
+                {
+                    continue;
+                }
+
+                dist_num = dy1 * dx - dx1 * dy;
+                if dy < 0.0 {
+                    dist_num = -dist_num;
+                }
+                counter += (dist_num > 0.0) as i32;
+            }
+
+            result = (min_dist_num / min_dist_denom).sqrt();
+            if counter % 2 == 0 {
+                result = -result;
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,7 +889,7 @@ mod tests {
         assert!(hull_pts.contains(&Point::new(4, 4)));
         assert!(hull_pts.contains(&Point::new(0, 4)));
         // 逆时针（OpenCV 默认 clockwise=false）
-        let area = contour_area(&hull_pts, true);
+        let area = crate::imgproc::contours::contour_area(&hull_pts, true);
         assert!((area - 16.0).abs() < 1e-9, "ccw area>0, got {area}");
         pts.clear();
     }
@@ -834,8 +982,12 @@ mod tests {
         let pts = box_points(r);
         // 四点都在 [0,4]² 内且包围方块
         for (x, y) in pts {
-            assert!(x >= -1e-3 && x <= 4.0 + 1e-3, "x={x}");
-            assert!(y >= -1e-3 && y <= 4.0 + 1e-3, "y={y}");
+            #[allow(clippy::manual_range_contains)]
+            let ok_x = x >= -1e-3 && x <= 4.0 + 1e-3;
+            #[allow(clippy::manual_range_contains)]
+            let ok_y = y >= -1e-3 && y <= 4.0 + 1e-3;
+            assert!(ok_x, "x={x}");
+            assert!(ok_y, "y={y}");
         }
     }
 
@@ -865,5 +1017,43 @@ mod tests {
         let (c, r) = min_enclosing_circle(&[Point::new(5, 9)]);
         assert_eq!(c, (5.0, 9.0));
         assert_eq!(r, 1.0e-4);
+    }
+
+    #[test]
+    fn point_polygon_test_inside_outside() {
+        // 正方形 (0,0)-(4,4)
+        let sq = [
+            Point::new(0, 0), Point::new(4, 0), Point::new(4, 4), Point::new(0, 4),
+        ];
+        // 内部
+        assert_eq!(point_polygon_test(&sq, (2.0, 2.0), false), 1.0);
+        // 外部
+        assert_eq!(point_polygon_test(&sq, (5.0, 5.0), false), -1.0);
+        // 边界
+        assert_eq!(point_polygon_test(&sq, (2.0, 0.0), false), 0.0);
+        // 顶点
+        assert_eq!(point_polygon_test(&sq, (0.0, 0.0), false), 0.0);
+    }
+
+    #[test]
+    fn point_polygon_test_measure_dist() {
+        let sq = [
+            Point::new(0, 0), Point::new(4, 0), Point::new(4, 4), Point::new(0, 4),
+        ];
+        // 中心到边距离 2
+        let d = point_polygon_test(&sq, (2.0, 2.0), true);
+        assert!((d - 2.0).abs() < 1e-6, "d={d}");
+        // 外部点 (6,2) 到边距离 2（负号）
+        let d = point_polygon_test(&sq, (6.0, 2.0), true);
+        assert!((d + 2.0).abs() < 1e-6, "d={d}");
+        // 边界距离 0
+        let d = point_polygon_test(&sq, (2.0, 0.0), true);
+        assert!(d.abs() < 1e-9, "d={d}");
+    }
+
+    #[test]
+    fn point_polygon_test_empty() {
+        assert_eq!(point_polygon_test(&[], (0.0, 0.0), false), -1.0);
+        assert_eq!(point_polygon_test(&[], (0.0, 0.0), true), -f64::MAX);
     }
 }

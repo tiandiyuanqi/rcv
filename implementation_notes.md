@@ -168,7 +168,7 @@ LTO（fat）会把 target_feature 内核内联进普通函数，intrinsic 失去
 - MeanC：`boxFilter(BORDER_REPLICATE|BORDER_ISOLATED)`
 - GaussianC：**f32 路径**（`src.convertTo(CV_32F)` → GaussianBlur f32 → convertTo u8 round-half-even），不是 u8 定点
 - 尾循环：`tab[src - mean + 255]`，idelta = ceil(delta)（Binary）/ floor(delta)（BinaryInv）
-- **已知未对齐**：我们的 GaussianC 走 u8 定点 gaussian，与 OpenCV f32 路径有 ±1 舍入差，被阈值放大（对拍 38.6dB，差异集中在 col 0）。修复方向：GaussianC 分支显式走 f32
+- **GaussianC 已对齐**（f32 路径 `gaussian_blur_f32_bitexact`）：5 图 × bs{3..51} × delta{0,±0.5,2.7,-7.3} × tt{0,1} × mv{255,128.7,300} 全 EXACT
 
 ### 3.5 to_grayscale
 
@@ -350,8 +350,10 @@ u8/u16：整数定点 `(R·9798 + G·19235 + B·3735 + 16384) >> 15`（round-hal
 | min_area_rect | 225 | - | 191 | - | 1.18× |
 | min_enclosing_circle | 1043 | - | 567 | - | 1.84× |
 | connected_components | 824 | 645 | 777 | 325 | 1.06× |
+| match_template_16x16 | 53.9-75.6 | - | 57.5 | - | 0.94-1.31× |
+| match_template_48x48_fft | 24.8-31.4 | - | 56.8 | - | 0.44-0.55× |
 
-（MPix/s；bilateral_d9 = d=9, 75/75, Reflect；median MT 数字波动大，5.7-8.4× 区间；形态学 ST 比值 1.06-1.67× 全部 ≥1.0×，2026-09-30 流式环形缓冲重写后数据，机器 load 6-16 噪声下 MT 波动 ±10%；梯度 2026-09-30 数据，sobel/scharr MT 波动 10-14K 区间，magnitude ST 0.98× 为纯带宽极限（单核 28GB/s vs OpenCV 29GB/s），MT 1.74× 补偿；canny 2026-10-06 数据，ST 0.91×，MT 0.65× 为 dx/dy 全图 mmap 分配缺页 + 全局洪泛串行段（OpenCV 块内小分配），内存池重构为遗留优化项。**2026-10-08 块内 Sobel + mag ring 4 槽修复后**：对拍 PSNR=inf，ST 典型 1200-1750（最佳 1948）vs OpenCV 1300-1700（最佳 1743）≈1.0×；MT 典型 1200-1650（最佳 2233）vs OpenCV 1400-1700（最佳 1801）≈0.95-1.2×，ST/MT 均达 OpenCV 水平，机器 load 8-50 剧烈震荡下多轮采样。**2026-10-08 二轮优化（NMS alignr + map TLS 池）**：AVX512 NMS 每批 mag loads 9→6（2×512 位 load + alignr 提取 [j+1,j+17)/[j+2,j+18) 列偏移视图，主循环条件收紧 j+32≤w+2）；map 1MB 分配进 CANNY_TLS 池（跨迭代迭代免 mmap 缺页）。同进程 50 次采样 min：ST 406µs（2582 MPix/s）vs OpenCV 空窗 ~560µs（1850）≈1.4×；MT 490µs（2142）vs OpenCV ~690µs（1500）≈1.4×。负载 20-50 时官方 bench 数字不可用，以 min 采样为准。**find_contours 2026-10-09 数据**：同进程 50 次 min 采样，list ST 553µs（1897）vs OpenCV 725µs（1411）=1.34×，list MT 570µs（1841）vs 1066µs（943-1066）=1.7-1.9×；tree（Suzuki 串行，OpenCV 同为串行）ST/MT 均 ~384 vs ~370 = 1.03×。TRU 优化链：offsets 预计算 + SIMD pad/二值化 + mem::take + 条带钳制 8。**绘制家族 2026-10-09 数据**：ST 全部 ≥1.0×（line 1.00×/rectangle 1.11×/circle 1.01×/ellipse 1.02×/polylines 1.04×/fill_poly 1.00×/draw_contours 1.12×）——绘制是标量 Bresenham/扫描线算法，双方同构，1.0× 即达上限；MPix/s 数字巨大是因为耗时与像素数无关（一条线 ~µs 级），仅作回归监控）
+（MPix/s；bilateral_d9 = d=9, 75/75, Reflect；median MT 数字波动大，5.7-8.4× 区间；形态学 ST 比值 1.06-1.67× 全部 ≥1.0×，2026-09-30 流式环形缓冲重写后数据，机器 load 6-16 噪声下 MT 波动 ±10%；梯度 2026-09-30 数据，sobel/scharr MT 波动 10-14K 区间，magnitude ST 0.98× 为纯带宽极限（单核 28GB/s vs OpenCV 29GB/s），MT 1.74× 补偿；canny 2026-10-06 数据，ST 0.91×，MT 0.65× 为 dx/dy 全图 mmap 分配缺页 + 全局洪泛串行段（OpenCV 块内小分配），内存池重构为遗留优化项。**2026-10-08 块内 Sobel + mag ring 4 槽修复后**：对拍 PSNR=inf，ST 典型 1200-1750（最佳 1948）vs OpenCV 1300-1700（最佳 1743）≈1.0×；MT 典型 1200-1650（最佳 2233）vs OpenCV 1400-1700（最佳 1801）≈0.95-1.2×，ST/MT 均达 OpenCV 水平，机器 load 8-50 剧烈震荡下多轮采样。**2026-10-08 二轮优化（NMS alignr + map TLS 池）**：AVX512 NMS 每批 mag loads 9→6（2×512 位 load + alignr 提取 [j+1,j+17)/[j+2,j+18) 列偏移视图，主循环条件收紧 j+32≤w+2）；map 1MB 分配进 CANNY_TLS 池（跨迭代迭代免 mmap 缺页）。同进程 50 次采样 min：ST 406µs（2582 MPix/s）vs OpenCV 空窗 ~560µs（1850）≈1.4×；MT 490µs（2142）vs OpenCV ~690µs（1500）≈1.4×。负载 20-50 时官方 bench 数字不可用，以 min 采样为准。**find_contours 2026-10-09 数据**：同进程 50 次 min 采样，list ST 553µs（1897）vs OpenCV 725µs（1411）=1.34×，list MT 570µs（1841）vs 1066µs（943-1066）=1.7-1.9×；tree（Suzuki 串行，OpenCV 同为串行）ST/MT 均 ~384 vs ~370 = 1.03×。TRU 优化链：offsets 预计算 + SIMD pad/二值化 + mem::take + 条带钳制 8。**绘制家族 2026-10-09 数据**：ST 全部 ≥1.0×（line 1.00×/rectangle 1.11×/circle 1.01×/ellipse 1.02×/polylines 1.04×/fill_poly 1.00×/draw_contours 1.12×）——绘制是标量 Bresenham/扫描线算法，双方同构，1.0× 即达上限；MPix/s 数字巨大是因为耗时与像素数无关（一条线 ~µs 级），仅作回归监控。**match_template 2026-10-16 数据**：小模板（16x16）走暴力卷积 SIMD，ST 53.9-75.6（负载相关）vs OpenCV 57.5 = 0.94-1.31×；大模板（48x48）走 FFT，ST 24.8-31.4 vs OpenCV 56.8 = 0.44-0.55×。**2026-10-16 FFT 优化链**（48x48 单次 104ms → ~42ms，2.5 倍）：① FftPlan 预计算旋转因子（SoA + AoS 交错表 + 位反转交换对 br_pairs，消除每行每级 cos/sin）；② RFFT 打包技巧——z = img + i·tpl 一次 FFT 得两频谱，频域解包直接算互相关 corr_spec = Im(Zk·Zm)/2 + i(|Zk|²-|Zm|²)/4（成对处理对称点，自对称点退化为 Re·Im），2 次正变换合并为 1 次；③ SoA 布局 FFT（butterfly8_soa 一次 8 蝶形零 shuffle）+ AVX2 8x8 块转置 transpose_square_soa_avx2（6.6→1.5ms）；④ 第一级（len=2）向量化（shuffle 0x88/0xDD stride-2 提取 + permutevar IDX_FIX 通道重排 + unpack/permute2f128 交错写回，11→7.7ms/1024 行）；⑤ 归一化 SIMD 化（normalize_corr_avx2，f64 4 路积分图查询 + blend 三级 clamp）+ 积分图换 integral_u8_i32_sqsum（7.6→1.1ms）+ 纯 CCorr 跳过积分图；⑥ u8→f32 填充 AVX2 化 + ifft2d 缩放合并到列变换。FFT 阈值 40x40（实测交叉点：暴力 32x32=53ms、48x48=93ms，FFT ~42ms 与模板尺寸无关）。剩余差距 1.8-2.3 倍在 FFT 数学层面：实数 IFFT（互相关频谱共轭对称，可省一半逆变换）、radix-4（级数减半）、5-smooth 尺寸分块（OpenCV 270x270 复用模板 FFT）。对拍：16x16 全方法 PSNR 92-141dB，96x96 全方法 PSNR 82-133dB，均 PASS）
 
 ---
 
@@ -359,7 +361,7 @@ u8/u16：整数定点 `(R·9798 + G·19235 + B·3735 + 16384) >> 15`（round-hal
 
 | # | 问题 | 影响 | 优先级 |
 |---|------|------|--------|
-| 1 | adaptive GaussianC 走 u8 定点，OpenCV 走 f32 + BORDER_ISOLATED | 对拍 38.6dB（col 0 的 144 像素差） | 中（正确性） |
+| 1 | ~~adaptive GaussianC 对拍 38.6dB~~ 已解决：GaussianC f32 路径（`gaussian_blur_f32_bitexact`）早已实现且全 EXACT（笔记未同步）。真正的问题是 **box_filter 大核（kw·kh>256）直接 panic**：u16 中间缓冲溢出。修复：① 调用方分派 area>256 走标量 f64 路径（对齐 OpenCV sumType=CV_32S：`s0(int)·scale(double) → cvRound`）；② 标量路径 f64 全程（新增 `Pixel::from_f64_round_even`，f64→f32 中转会让 .5 边界错位）。对拍：box 6 图 × bs{3..51} × norm × border{0,1,2} × gray/rgb 全 EXACT；adaptive mean 大核 bs{17..51} 全 EXACT | 已关闭 | - |
 | 2 | bilateral AVX2 内核用了 `_mm256_cvtps_epu32`（AVX512VL） | AVX2-only CPU 可移植性 | 低（当前机器 Avx512） |
 | 3 | bilateral f32 路径仅标量 + rayon（无 SIMD） | f32 吞吐低于 u8 | 低 |
 | 4 | error.rs 多余变体未按新 API 契约裁剪 | 文档/代码不一致 | 低 |
@@ -370,6 +372,7 @@ u8/u16：整数定点 `(R·9798 + G·19235 + B·3735 + 16384) >> 15`（round-hal
 | 9 | imwrite JPEG 编码 0.15×（23.8 vs 161.7 MPix/s）：`image` crate 纯 Rust 标量编码器 vs OpenCV libjpeg-turbo SIMD。PNG 写 1.61×/读 1.32× 已领先。优化方向：turbojpeg-sys FFI 后端（重依赖）或等待 image crate SIMD 化 | 低（IO 非热路径） |
 | 10 | imwrite PNG 灰度 0.55×（71.6 vs 129.8）：rcv 灰度/RGB 同速，OpenCV 灰度路径有独立优化 | 低 |
 | 11 | ~~connected_components 0.71×~~ 已解决（2026-10-10）：flatten 只到 lunique + labels/p 未初始化分配（pass1 全覆盖）+ pass2 内核进 simd_kernels（裸指针 8 展开）+ MT 条带并行（对齐 LabelingWuParallel，条带钳 16）。ST 824 vs 777 = 1.06×，MT 645 vs 325 = 1.98×。教训：① checked 索引 + movslq 在 gather 循环代价 ~2×，此类内核必须进 simd_kernels；② `Vec::clone` ≠ memcpy（267 vs 130µs），profiling 对照需含相同前缀；③ MT profiling 的"原地幂等重复"会因值域收敛高估 C++（p[p[x]] 二次起索引全 L1），必须 fresh 输入对照 | 已关闭 | - |
+| 12 | match_template 大模板 FFT 路径 0.44-0.55×（48x48：24.8-31.4 vs 56.8 MPix/s，2026-10-16 优化后从 0.11× 提升）：已做 FftPlan 预计算 + RFFT 打包 + SoA SIMD + AVX2 转置 + 归一化 SIMD。剩余优化：实数 IFFT（频谱共轭对称可省一半逆变换，需推导 packed 解包公式）、radix-4（级数减半）、5-smooth 尺寸分块（OpenCV 270x270 复用模板 FFT） | 中（已 2.5 倍，剩余为数学层重构） |
 
 ---
 
@@ -397,3 +400,296 @@ u8/u16：整数定点 `(R·9798 + G·19235 + B·3735 + 16384) >> 15`（round-hal
 - [ ] 行阶段 kw=3 特化（`morph_row_u8_direct_k3`，编译期展开运行时循环）
 - [ ] 常量边框：erode 恒等 255、dilate 恒等 0；复合运算两阶段 border 值不同
 - [ ] 性能：行阶段读 3 重叠向量（1x 放大）为瓶颈；col2/fused 均回归，勿用
+
+## warp_affine / warp_perspective 位级对齐（2026-10-12 收官）
+
+全矩阵 EXACT（7 图 × gray/RGB × 全参数，PSNR=inf）：
+- warp_affine：7 角度 × 3 缩放 × 3 插值 × 2 边界 × 2 色彩 = 588 组合
+- warp_perspective：4 矩阵 × 3 插值 × 2 边界 × 2 色彩 = 336 组合
+
+### 关键语义（OpenCV 5.0 实测，AVX2 dispatch）
+- **dispatch 层级**：warp_kernels.simd.hpp 只编译到 AVX2（无 AVX512 版符号）；
+  v_float32 = 8 lanes，**UF = 16**（unrolling factor）
+- **坐标公式（NN/Linear，warp_kernels invoker）**：
+  - SIMD 段（x < simd_end）：`M_x = f32(y*M1 + M2)`（分离），`sx = fma(M0, x, M_x)`
+  - 标量尾段：全分离 `x*M0 + y*M1 + M2`（GCC 无 contract）
+  - simd_end = dw >= 16 ? (dw-16)/16*16+16 : 0
+- **cubic 坐标（genericWarp xbuf）**：`xbuf[dx] = M_x + M_xx*xf`（分离乘加）
+- **perspective cubic 坐标**：f64 域 `invz = 1/(M_z + M_zx*xf)`，
+  `xbuf = f32((M_x + M_xx*xf)*invz)`；M_x/M_y/M_z 先 f32 舍入再提升 f64
+- **cubic 权重（bicubicWeights AVX2 汇编顺序）**：
+  - `w0 = A*(alpha*b2)`、`w3 = A*(b*a2)`（乘法结合顺序影响 1ulp！）
+  - `w1 = fma(a2, fma(A+2, alpha, -(A+3)), 1)`
+  - `w2 = 1-w0-w1-w3`（左结合减法链）
+- **cubic 累加**：inlier（SIMD 段）全 fma 链；标量尾段全分离
+  （`acc += (v0*wx0+v1*wx1+v2*wx2+v3*wx3)*wy`）
+- **linear 插值**：`v0 = fma(sx, p1-p0, p0)`（fma 链，含边界路径）
+- **AVX cvtps2dq 溢出语义**：v_round/v_floor 越界（|v| >= 2^31）→ i32::MIN
+  （0x80000000），非饱和——perspective w≈0 时 sx 巨大 → INT_MIN → clamp 0
+- **NN inlier**：`ix < sw-1 && iy < sh-1`（unsigned）；REPLICATE 用
+  borderInterpolate_fast（clamp）
+- M 求逆：warpAffine 用 2x3 伴随法（D=1/(M0*M4-M1*M3)），
+  warpPerspective 用 cv::invert 3x3（LU，与伴随法数值一致）
+
+## warp/resize SIMD 优化（2026-10-13 收官，单线程全面超越 OpenCV5 出厂默认）
+
+单线程 1024×1024 RGB（best-of-5，同机同图，**OpenCV 为出厂默认配置——IPP 加速启用**）：
+
+| 基准 | Rust | OpenCV5（IPP on） | 加速比 |
+|---|---|---|---|
+| warp_affine_linear | 166 | 131 | 1.27x |
+| warp_perspective_linear | 146 | 90 | 1.62x |
+| warp_affine_cubic | 92 | 50 | 1.85x |
+| warp_perspective_cubic | 78 | 38 | 2.07x |
+| resize_linear_half | 8414 | 3436 | 2.45x |
+| resize_cubic_half | 1655 | 1278 | 1.29x |
+
+### 重要教训 1：IPP 基准污染与"降低标准"陷阱
+- 早期 bench_opencv5.cpp 未禁 IPP，resize_cubic_half 报 1281（ippiResizeCubic_8u
+  手写内核）；一度通过禁 IPP（358）宣布"超越"，**这是把对手打折再宣布获胜，
+  不诚实**——IPP 是 OpenCV 发行版组成部分，用户拿到的就是 IPP 加速性能
+- 最终基准恢复出厂默认（IPP on），Rust 需真实超过 1278 才算赢
+- IPP resize CUBIC 输出与纯 OpenCV 路径**并非位级一致**（scale≠0.5 时不同），
+  位级对齐目标仍以纯 OpenCV 路径为准（ref 禁 IPP），性能目标以 IPP 为准
+- **教训：性能对拍的"对手配置"必须与用户实际部署一致，不能为了赢而削弱**
+
+### 重要教训 2：微基准与端到端的 4 个陷阱（resize_cubic 优化全程）
+1. **DCE**：`let _ = resize(...)` 被优化掉，测出 2232 MPix/s 假象；
+   必须 `black_box(d.data())`
+2. **意外多线程**：proto 未初始化 rayon，`current_num_threads()` 返回 64
+   （默认全局池），resize 走 MT 路径测出 1400-1600 假象；bench.rs 显式
+   `num_threads(1)` 才是诚实单线程（700）。**单线程基准必须固定线程池**
+3. **AVX512/AVX2 混用 penalty**：VBMI HResize（zmm）微基准快 2.6x，但与
+   AVX2 VResize（ymm）混用后端到端反而 -22%（899→700）。解法：VResize
+   也升级 AVX512，整帧纯 zmm
+4. **帧级检测 vs 逐行检测**：VBMI 路径的 stride=6 等距检测 O(dw) 若在
+   每行 HResize 里做（1026 行 × 512 比较），开销吞掉全部收益（834 vs
+   琯论 1600+）。解法：检测提升到 resize_generic 帧级一次（xofs 帧内
+   不变），run() 传 flag
+
+### pack8_u8：AVX2 打包链的 lane 复制陷阱（严重 bug）
+- `_mm256_packus_epi16(_mm256_packs_epi32(r, r), _mm256_packs_epi32(r, r))`
+  低 64 位是 [r0,r1,r2,r3,r0,r1,r2,r3]（每级 pack 都在 lane 内复制），
+  不是 [r0..r7]——warp linear/cubic 快路径曾因此每批 8 像素中后 4 个
+  复制前 4 个的值（identity warp 测试暴露）
+- 正确做法：packs→packus 后 low128 低 4 字节 + high128 低 4 字节用
+  `_mm_unpacklo_epi32` 拼接（`pack8_u8` 辅助函数）
+- **教训：AVX2 打包链必须显式验证 8 元素全序；(r,r) 自打包只对 4 元素有效**
+
+### warp linear Replicate 边界：gather 跨行读污染（严重 bug）
+- C3 gather 方案 `addr+3` 取 tap1，隐含假设 "ix+1 与 ix 同行"；ix clamp 到
+  sw-1 时 addr+3 是下一行行首，而标量语义 p01 = p00（clamp 后同像素）
+- 修复：`same_x = cmpeq(ix1_c, ix_c)`，`blendv(p01_raw, p00, same_x)`；
+  cubic 无此问题（每 tap 独立 gather，clamp 后地址即正确）
+
+### hresize_cubic 优化路径（411 → 1655 MPix/s）
+1. alpha gather → 连续加载 + INTERLEAVE（411→622）
+2. madd_epi16 替代 4×mullo+3×add（622→808）
+3. 16 位置/批（808→833）
+4. 预交错 ialpha01/23（准备阶段构造，SIMD 直接 loadu；修复 SH_A01/23
+   掩码字节序 bug——旧掩码取 i16 索引 [0,2,4,6] 即 [a0,a2] 对而非 [a0,a1]）
+5. SH_PAIR：cn=3 时 gather dword 的字节 0/3 恰为同通道 [tap0,tap1] 对，
+   一次 shuffle_epi8 直接提取 i16 对（省 2×packs + 2×INTERLEAVE）（833→903）
+6. AVX512VBMI vpermb：16 位置全部 taps 落在 43 字节窗口（<64），单个
+   64 字节 loadu + 2×vpermb（紧凑 [t0,t1] 字节对）+ 2×cvtepu8_epi16
+   （零扩展）+ 2×madd，零 gather；配对 AVX512 VResize（16/批）避免
+   混用 penalty；帧级模式检测（903→1655）
+- **vpermb 掩码字节序陷阱**：掩码字节 bit7 置位**不是**输出 0（实测按
+  低 6 位索引取 win[0]）；正确做法是紧凑布局 [t0_i, t1_i] + cvtepu8_epi16
+  零扩展，而非直接排 [t0, 0, t1, 0]
+- **vpmovusdb 语义陷阱**：`_mm512_cvtusepi32_epi8` 按无符号解释源
+  （负 i32 → 255 而非 0）；需先 `_mm512_max_epi32(r, 0)` 有符号 clamp
+
+### VResize SIMD 段边界必须对齐 OpenCV（位级关键）
+- OpenCV `VResizeCubicVec_32s8u` SIMD 段 = 8 的倍数（v_int16 vlanes），
+  尾段走 VResizeCubic 标量 FixedPtCast `(val+2^21)>>22`——**f32 链与
+  定点舍入在 tie 情况差 1**
+- AVX512 版（16/批）若直接把 [width&~15, width) 交给定点尾段，width=3000
+  时最后 8 个位置与 OpenCV（8 倍数边界）不一致 → PSNR 100dB 级微差
+- 修复：16 批主循环后，剩余 ≥8 用 masked 512-bit 批（f32 链语义），
+  仅最后 <8 走定点标量
+
+### warp 快路径结构（warp_linear_fast_u8 / warp_cubic_fast_u8）
+- 每批 8 像素，affine 分离乘加 / perspective f64 域（cubic）或 f32
+  div（linear，对齐 OpenCV warp_kernels AVX2 语义）
+- Replicate 边界：SIMD clamp 坐标覆盖全部像素（含 OOB），无标量回退
+  ——warp 性能超 OpenCV 的关键（OpenCV OOB 批整体回退标量）
+- Constant 边界：all-inlier 才走 SIMD，否则 8 像素标量回退
+
+### 验证矩阵（全 EXACT）
+- warp_affine 882 + warp_perspective 168 + resize 140 = 1190 组合
+- cargo test 214 passed；clippy 无 unused；check_unsafe OK
+- resize_cubic_half 1655 vs OpenCV(IPP) 1278 = 1.29x，位级仍对齐纯
+  OpenCV 路径（ref 禁 IPP 且 EXACT）
+
+### 非临时存储（movntdq/movntps）提升纯流式带宽
+- **3 流（2 读 + 1 写）位运算**：bitwise_and/or/xor 用 `_mm512_stream_si512`
+  写输出，避免写分配（RFO），0.80x → 1.34x（超 OpenCV）。输出为
+  `Image::new_uninit` 的 16 字节对齐缓冲，需头部标量 + 中部 64 字节对齐
+  流式写 + 尾部回退。
+- **threshold_binary**：同样非临时存储，0.87x → 0.95x（接近 OpenCV IPP）。
+- **magnitude32f**：f32 3 流，`_mm512_stream_ps`，0.94x → 1.25x。
+- **bitwise_not（2 流）**：非临时存储反而**变慢**（0.90x），回退普通
+  `storeu`。教训：非临时存储只对 ≥3 流（写分配占比高）有效；2 流时
+  输出复用缓存，流式写绕过缓存反而损失。
+- 对齐头计算：`head = ((64 - (dst_ptr & 63)) & 63) / elem_size`，须
+  `min(n)` 防小输入越界（magnitude 测试 n=2 曾越界）。
+
+### find_contours_list 单趟扫描 bug（hang 根因）
+- `scan_row_runs`（AVX512 单趟块扫描）内层 `while m != 0` 循环在
+  `m = shifted >> to` 后，`tz`/`to` 相对**移位后**的 m，但 `p = k + tz`
+  与边界检查 `tz + to == 64` 按绝对偏移用 → 多 run 块内第 2+ 个 run
+  位置错乱（左移），且跨块边界 run 被拆分（42432 vs 35260 runs）。
+- 修复：加 `bit` 累计偏移，`p = k + bit + tz`，边界检查
+  `bit + tz + to == 64`。差分测试（fc_bench30）验证 0 失配。
+- 该 bug 导致 `tru_process_stripe` 预扫描模式下 `tru_trace_contour`
+  死循环（fc_bench27 hang）。修复后 find_contours_list 0.83x → 1.06x。
+
+### draw_fill_poly AET 热循环消除边界检查
+- `fill_edge_collection` 的 AET 扫描线循环用下标链表（`edges[last]`），
+  编译器无法消除边界检查（下标来自链表）。改用 `get_unchecked` 消除，
+  0.88x → ~1.0x（超 OpenCV）。
+- **架构约束**：`scripts/check_unsafe.sh` 禁止 `simd_kernels/` 之外 unsafe。
+  故将 AET 循环移到 `simd_kernels/drawing.rs`（`fill_edges_aet`），
+  接收 `&mut [PolyEdge]`（安全切片），内部用 `get_unchecked` 宏消除
+  边界检查。`drawing.rs` 仅做安全前置（排序、哨兵、边界裁剪）。
+- `PolyEdge` 字段改为 `pub(crate)` 供 simd_kernels 访问。
+
+### 43 项全量对拍（Rust vs OpenCV IPP on）
+- 33 胜 / 10 负 → **38 胜 / 5 负**。剩余 5 负均 0.94-0.98x（噪声内）：
+  draw_line 0.94x、box_filter_3x3 0.94x、draw_polylines 0.94x、
+  threshold_binary 0.95x、bitwise_not 0.98x。
+- 关键提升：bitwise_and/or/xor 1.34x、magnitude 1.25x、find_contours_list
+  1.06x、draw_fill_poly ~1.0x、threshold_binary 0.95x。
+
+### 第二轮优化：5 项落后 → 40 胜 / 3 负（原 38/5）
+- **bitwise_not 0.82x → ~0.97x**：非临时存储（movntdq）+ 2×64 展开 +
+  `_mm512_xor_si512(va, ones)` 替代 ternlog。2 流（1 读 + 1 写）操作，
+  输出每次新分配（冷），流式写绕过 RFO。2×64 展开隐藏 load/store 延迟。
+- **cart_to_polar 0.90x → 1.07x**：主循环 2×16 展开（对齐 OpenCV 2×VECSZ），
+  隐藏 `_mm512_div_ps` 高延迟（~20 周期）。atan 系数与 OpenCV `v_atan_f32`
+  逐位一致。
+- **draw_line 0.92x → ~1.03x**：`line_raster` 热循环移到 simd_kernels
+  （`raster_line`，get_unchecked 写像素）；`Canvas::hline`/`put_point` 也
+  改为调用 simd_kernels 的 `hline`/`put_point`（get_unchecked 消除切片
+  边界检查）。draw_line 走 thick_line → fill_convex_poly_fixed（4 边
+  line_raster + AET 填充 + 端点圆），per-pixel 边界检查是瓶颈。
+- **threshold_binary 0.92x → ~1.0x**：中部循环 4×64 展开（更多 outstanding
+  load/store 饱和带宽）。type 0 用 `_mm512_maskz_mov_epi8(cmpgt, maxval)`。
+- **box_filter_3x3 0.99x → 1.01x**：噪声内（内存带宽型）。
+- 全量对拍 40 胜 / 3 负。剩余 3 负（bitwise_not 0.89x、draw_line 0.99x、
+  threshold_binary 0.90x）为全量顺序跑时的缓存态噪声；隔离跑均 ~0.97-1.03x。
+- **架构约束**：`Canvas::hline`/`put_point`/`line_raster` 的 unsafe 写均
+  移到 `simd_kernels/drawing.rs`（`hline`/`put_point`/`raster_line`），
+  接收 `&mut [u8]` 安全切片，内部 `get_unchecked_mut`。drawing.rs 无 unsafe。
+
+### 第三轮优化：最后 2 项落后 → 全部转胜
+- **threshold_binary 0.91x → ~1.0x**：新增 `threshold_binary_u8` 特化
+  （type 0，THRESH_BINARY），无 `match type_` 分支，热循环更紧凑。
+  非临时存储 + 4×64 展开。`mod.rs` 派发：type_==0 走特化，否则走通用。
+- **box_filter_3x3 0.99x → ~1.05x**：C=3、kw=3 行和特化 AVX512
+  （`dst[i] = src[i-3] + src[i] + src[i+3]`，3 抽头步长 1）。原走
+  `avx2::box_row_sum_u8_direct_cn` 标量自动向量化（stride-3 访问 LLVM
+  向量化差）。新内核每批 64 元素，3 个 loadu（偏移 -3/0/+3）+ 零扩展
+  u16 求和。位级 EXACT（PSNR=inf）。
+- 全量对拍：39-41 胜 / 2-4 负（内存带宽型噪声大，隔离跑均 ~1.0x）。
+  connected_components 偶现 0.78x 为 CPU 频率/缓存态噪声（compute-heavy，
+  未改其代码，隔离跑 1.02x）。
+
+### 距离变换（distance_transform）实现
+- **算法**：OpenCV chamfer 两遍扫描（前向 + 后向），定点算术（DIST_SHIFT=16），
+  掩码值 `CV_FLT_TO_FIX(x,16)=cvRound(x*65536)`（RNE）。3×3/5×5 掩码，
+  DIST_C/L1/L2 六种组合全部位级 EXACT（PSNR=inf）。
+- **SIMD 优化（分块并行扫描，第三轮）**：
+  - 核心洞察：chamfer 水平依赖是 min-plus 前缀/后缀扫描（`v[k]=min(a[k], v[k±1]+hv)`），
+    串行依赖链是瓶颈（~2.5 cycles/px）。用 **Brent-Kung 分块扫描** 打破串行链：
+    - **Phase 1**：每 16-px 块独立做局部前缀/后缀扫描（4 步 log 扫描，`alignr` 移位 +
+      clamp 加法 + `mask_min_epu32`），块间无依赖，可流水。
+    - **Phase 2+3 融合**：串行 stitch 只跨块（每块 1 次 `bcast + ramp + min`），
+      块的 lane0/lane15 输出即下一块 incoming，链长 O(w/16) 而非 O(w)。
+  - **关键正确性细节**：
+    - 必须用 **`_mm512_mask_min_epu32`（无符号）**，不能用 `_mm512_mask_min_epi32`
+      （有符号）——距离值可 > 2^31，有符号 min 会选错（曾致 PSNR=4.7 FAIL）。
+    - 扫描加法 `a[k+s]+s*hv` 可能回绕（`s*hv > diag/long` 时），产生假胜出。
+      解法：每步先 clamp 源 `min(a[k+s], dist_max - s*hv)` 再加，贡献 ≥ dist_max
+      永不胜出（`a[k] ≤ dist_max`），且无回绕。
+    - 折叠 `bcast(incoming) + ramp*hv` 的回绕用 `cmplt_epu32_mask` 检测后
+      `mask_mov` 置 `u32::MAX`。
+    - 前向零掩码：`_mm_test_epi8_mask` 置位非零字节，需**取反**（`!zm`）才把
+      `s[j]==0` 的 lane 置 0。
+    - 5×5 水平依赖可降为一阶（`v[k]=min(a[k], v[k+1]+hv)`）：因 `2*hv ≤ long`
+      恒成立（C/5:2≤2, L1/5:2≤3, L2/5:131072≤143976），`v[k+2]+long ≥ v[k+1]+hv`，
+      二阶项永不胜出（与 OpenCV 输出位级一致）。
+  - 后向定点→浮点转换融合进 Phase 3（`cvtepi32_ps * scale`），省去独立转换遍。
+- **关键优化：thread_local temp 缓冲**。冷启动 cache miss 是主要瓶颈
+  （fresh temp+dst 227 MPix/s vs 复用 429 MPix/s）。用 `TEMP_BUF` thread_local
+  复用 temp，避免每次调用重新分配导致 cache miss。
+- **性能**：3x3 872-874 MPix/s vs OpenCV 364（**2.40x**，原 1.33x）；
+  5x5 709-713 vs 289（**2.46x**，原 1.45x）。
+- **AVX2 同步实现**：`avx2.rs` 的 `dist_forward_3x3/5x5`、`dist_backward_3x3/5x5`
+  与 AVX512 同构（分块并行扫描），每批 8 像素（256-bit）。dispatch 改为
+  `AVX512 → AVX2 → 标量`。AVX2 差异：
+  - 移位用 `_mm256_permutevar8x32_epi32`（`_mm256_alignr_epi32` 是 128-bit lane 内）。
+  - 无 `_mm256_mask_min_epu32` → `_mm256_min_epu32` + `_mm256_blendv_epi8`。
+  - 无 `_mm256_cmplt_epu32_mask` → 符号翻转技巧（`t^0x80000000 < vr^0x80000000`）。
+  - 零掩码用 `_mm256_cvtepu8_epi32` 零扩展 + `_mm256_cmpeq_epi32` + blendv。
+  - 6 组合全部位级 EXACT（与 AVX512 逐位一致，含非 8 倍数宽度尾部）。
+- 新增 `alloc_uninit_aligned64`（未用，保留备用）。
+
+## AVX2 全覆盖（补齐 AVX512-only 缺口）
+
+审计所有 dispatch（mod.rs / contours.rs / edges.rs / gaussian.rs / box_filter.rs /
+bilateral.rs / median.rs / morphology.rs / gradient.rs），确认 AVX512-only 缺口仅 2 处，
+已补齐：
+
+- **`threshold_binary_u8`**（avx2.rs）：二值阈值快路径，`_mm256_movemask_epi8` 无符号
+  比较 + `_mm256_stream_si256` 非临时写（对齐 avx512 版）。dispatch 在 mod.rs 的
+  `threshold_u8` 中 type_==0 时走此快路径。
+- **`scan_row_runs`**（avx2.rs）：单趟 run 边界扫描，`_mm256_movemask_epi8` 得 32 位
+  非零掩码，tz/to 位操作提取 run（对齐 avx512 版，32 字节/批）。dispatch 在
+  contours.rs 加 AVX2 分支。
+
+其余 AVX512-only 均为设计使然（非缺口）：
+- `canny_low_mask64`/`canny_fill_one64`：AVX512 用 64 位批；AVX2 用 32 位批
+  （`canny_low_mask32`/`canny_fill_one32`，已实现）。
+- `hresize_cubic_vbmi`/`vresize_cubic_u8`：VBMI 快路径，无 VBMI 时回退
+  `x86::warp::hresize_cubic_u8`/`vresize_cubic_u8`（AVX2 实现，已覆盖）。
+
+**性能对比**（1M 元素，best-of-200，本机 AVX512）：
+- threshold_binary：AVX512 44.6us / AVX2 42.6us / 标量 706us（AVX2 ≈ AVX512，均 ~16x 标量）。
+- scan_row_runs：AVX512 1000us / AVX2 1213us / 标量 3180us（AVX2 ~2.6x 标量；
+  AVX512 因 64 字节/批比 AVX2 快 ~1.2x，符合预期）。
+
+验证：214 测试通过、check_unsafe OK、AVX2 内核与标量/AVX512 逐位一致
+（scan_row_runs 覆盖 1..1024 宽度，threshold_binary 覆盖 1..4096 长度）。
+
+## 文字绘制（put_text，支持汉字）
+
+- **方案**：内置 16x16 点阵位图字体（`src/imgproc/font_data.rs`，自动生成）。
+  用 `ab_glyph`（dev-dependency）从文泉驿微米黑 TTF 栅格化，居中到 16x16 单元。
+  覆盖 ASCII（95）+ 常用汉字（~500，`scripts/common_hanzi.txt`），共 594 字形。
+- **生成**：`cargo run --release --example gen_font -- <ttf>` 重新生成 font_data.rs。
+  字形按码点升序，二分查找。
+- **API**（`src/imgproc/text.rs`）：
+  - `put_text(img, text, org, color, scale, thickness)`：单通道，org 为左上角，
+    scale 缩放字形（1.0=16x16），thickness 加粗（1=正常）。
+  - `put_text_rgb`：3 通道版。
+  - `get_text_size(text, scale)`：返回 (宽, 高)。
+  - `\n` 换行（x 重置、y 前进 cell）。
+- **渲染**：逐字形像素 blit，含缩放（最近邻）与加粗（向四周扩展 thick-1），
+  越界裁剪。未收录字符（生僻字）跳过。
+- 验证：9 个单元测试（尺寸、灰度/RGB 渲染、缩放、加粗、换行、越界裁剪、
+  未知字符跳过），223 测试通过、check_unsafe OK。
+
+### 文字渲染性能优化
+
+- **快路径**：`cell == 16 && thick == 1` 时走 1:1 逐像素 blit（无缩放无加粗），
+  一次边界检查，避免逐像素除法。
+- **通用路径**：缩放 + 加粗，逐字形像素扩展（`(x0-r)..x1`），行级边界检查。
+- **性能**（14 字符，1024x1024，best-of-5）：
+  - 1x 灰度 3.44us / 1x RGB 3.74us
+  - 2x 灰度 6.54us / 2x RGB 7.99us
+  - 加粗 thick3 9.43us
+  - 对比初版：1x 灰度 -21%，1x RGB -18%，加粗 -7%。
+- 注：曾尝试膨胀（dilate）预计算加粗，但膨胀后字形更密集导致 blit 更慢，
+  回退为逐字形像素扩展（原方案）。

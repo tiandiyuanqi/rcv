@@ -115,26 +115,28 @@ impl<'a> Canvas<'a> {
     /// ICV_PUT_POINT：写单像素（无边界检查，调用方保证）。
     #[inline(always)]
     pub(crate) fn put_point(&mut self, x: i32, y: i32) {
-        let off = y as usize * self.step + x as usize * self.pix_size;
-        let p = &mut self.data[off..off + self.pix_size];
-        p.copy_from_slice(&self.color[..self.pix_size]);
+        crate::simd_kernels::drawing::put_point(
+            self.data,
+            self.step,
+            self.pix_size,
+            &self.color,
+            x,
+            y,
+        );
     }
 
     /// ICV_HLINE：水平填充 [xl, xr]（无边界检查，调用方保证）。
     #[inline(always)]
     pub(crate) fn hline(&mut self, y: i32, xl: i32, xr: i32) {
-        let row = y as usize * self.step;
-        let start = row + xl as usize * self.pix_size;
-        let end = row + (xr as usize + 1) * self.pix_size;
-        if self.pix_size == 1 {
-            self.data[start..end].fill(self.color[0]);
-        } else {
-            let mut i = start;
-            while i < end {
-                self.data[i..i + self.pix_size].copy_from_slice(&self.color[..self.pix_size]);
-                i += self.pix_size;
-            }
-        }
+        crate::simd_kernels::drawing::hline(
+            self.data,
+            self.step,
+            self.pix_size,
+            &self.color,
+            y,
+            xl,
+            xr,
+        );
     }
 }
 
@@ -213,69 +215,18 @@ pub(crate) fn line_raster(
     if !clip_line(cv.width as i64, cv.height as i64, &mut p1, &mut p2) {
         return;
     }
-    let mut pt1 = Point::new(p1.x as i32, p1.y as i32);
-    let mut pt2 = Point::new(p2.x as i32, p2.y as i32);
-
-    let mut delta_x = 1i32;
-    let mut delta_y = 1i32;
-    let mut dx = pt2.x - pt1.x;
-    let mut dy = pt2.y - pt1.y;
-
-    if dx < 0 {
-        // leftToRight = true（对齐 Line() 的 LineIterator 构造）：
-        // 交换端点，从左往右画
-        dx = -dx;
-        dy = -dy;
-        std::mem::swap(&mut pt1, &mut pt2);
-    }
-    if dy < 0 {
-        dy = -dy;
-        delta_y = -1;
-    }
-
-    let vert = dy > dx;
-    if vert {
-        std::mem::swap(&mut dx, &mut dy);
-        std::mem::swap(&mut delta_x, &mut delta_y);
-    }
-
-    let (err, plus_delta, minus_delta, mut minus_shift, mut plus_shift, mut minus_step, mut plus_step, count);
-    if connectivity == 8 {
-        err = dx - (dy + dy);
-        plus_delta = dx + dx;
-        minus_delta = -(dy + dy);
-        minus_shift = delta_x;
-        plus_shift = 0;
-        minus_step = 0;
-        plus_step = delta_y;
-        count = dx + 1;
-    } else {
-        err = 0;
-        plus_delta = (dx + dx) + (dy + dy);
-        minus_delta = -(dy + dy);
-        minus_shift = delta_x;
-        plus_shift = -delta_x;
-        minus_step = 0;
-        plus_step = delta_y;
-        count = dx + dy + 1;
-    }
-    let mut err = err;
-
-    if vert {
-        std::mem::swap(&mut plus_step, &mut plus_shift);
-        std::mem::swap(&mut minus_step, &mut minus_shift);
-    }
-
-    let mut x = pt1.x;
-    let mut y = pt1.y;
-    for _ in 0..count {
-        cv.put_point(x, y);
-        // LineIterator::operator++（ptmode 分支）
-        let mask = if err < 0 { -1i32 } else { 0 };
-        err += minus_delta + (plus_delta & mask);
-        x += minus_shift + (plus_shift & mask);
-        y += minus_step + (plus_step & mask);
-    }
+    let pt1 = Point::new(p1.x as i32, p1.y as i32);
+    let pt2 = Point::new(p2.x as i32, p2.y as i32);
+    // 热循环移到 simd_kernels/（get_unchecked 写，消除 put_point 边界检查）
+    crate::simd_kernels::drawing::raster_line(
+        cv.data,
+        cv.step,
+        cv.pix_size,
+        &cv.color,
+        (pt1.x, pt1.y),
+        (pt2.x, pt2.y),
+        connectivity,
+    );
 }
 
 /// 斜率校正表（对齐 drawing.cpp:296）。
@@ -461,10 +412,10 @@ pub(crate) fn line_aa(cv: &mut Canvas, mut pt1: Point2l, mut pt2: Point2l) {
 
         ep_table[0] = 0;
         ep_table[8] = slope;
-        ep_table[1] = (((((j_frac - i_frac) & 0x78) | 4) * slope as i64 >> 8) & 0x1ff) as i32;
+        ep_table[1] = ((((((j_frac - i_frac) & 0x78) | 4) * slope as i64) >> 8) & 0x1ff) as i32;
         ep_table[3] = ep_table[1];
         ep_table[2] = ((t1 >> 8) & 0x1ff) as i32;
-        ep_table[4] = (((((j_frac - i_frac) + 0x80) | 4) * slope as i64 >> 8) & 0x1ff) as i32;
+        ep_table[4] = ((((((j_frac - i_frac) + 0x80) | 4) * slope as i64) >> 8) & 0x1ff) as i32;
         ep_table[5] = (((t1 + t0) >> 8) & 0x1ff) as i32;
         ep_table[6] = ((t2 >> 8) & 0x1ff) as i32;
         ep_table[7] = (((t2 + t0) >> 8) & 0x1ff) as i32;
@@ -499,15 +450,15 @@ pub(crate) fn line_aa(cv: &mut Canvas, mut pt1: Point2l, mut pt2: Point2l) {
                         + (((e >= 2) as i32 + 1) & (e | 2)) as usize];
                 let dist = ((pt1.y >> (XY_SHIFT - 5)) & 31) as usize;
 
-                let a = (ep_corr * FILTER_TABLE[dist + 32] >> 8) & 0xff;
+                let a = ((ep_corr * FILTER_TABLE[dist + 32]) >> 8) & 0xff;
                 if (0..size0_h).contains(&y) {
                     put_aa!(x, y, a);
                 }
-                let a = (ep_corr * FILTER_TABLE[dist] >> 8) & 0xff;
+                let a = ((ep_corr * FILTER_TABLE[dist]) >> 8) & 0xff;
                 if (0..size0_h).contains(&(y + 1)) {
                     put_aa!(x, y + 1, a);
                 }
-                let a = (ep_corr * FILTER_TABLE[63 - dist] >> 8) & 0xff;
+                let a = ((ep_corr * FILTER_TABLE[63 - dist]) >> 8) & 0xff;
                 if (0..size0_h).contains(&(y + 2)) {
                     put_aa!(x, y + 2, a);
                 }
@@ -528,15 +479,15 @@ pub(crate) fn line_aa(cv: &mut Canvas, mut pt1: Point2l, mut pt2: Point2l) {
                         + (((e >= 2) as i32 + 1) & (e | 2)) as usize];
                 let dist = ((pt1.x >> (XY_SHIFT - 5)) & 31) as usize;
 
-                let a = (ep_corr * FILTER_TABLE[dist + 32] >> 8) & 0xff;
+                let a = ((ep_corr * FILTER_TABLE[dist + 32]) >> 8) & 0xff;
                 if (0..size0_w).contains(&x) {
                     put_aa!(x, y, a);
                 }
-                let a = (ep_corr * FILTER_TABLE[dist] >> 8) & 0xff;
+                let a = ((ep_corr * FILTER_TABLE[dist]) >> 8) & 0xff;
                 if (0..size0_w).contains(&(x + 1)) {
                     put_aa!(x + 1, y, a);
                 }
-                let a = (ep_corr * FILTER_TABLE[63 - dist] >> 8) & 0xff;
+                let a = ((ep_corr * FILTER_TABLE[63 - dist]) >> 8) & 0xff;
                 if (0..size0_w).contains(&(x + 2)) {
                     put_aa!(x + 2, y, a);
                 }
@@ -1000,11 +951,11 @@ pub(crate) fn fill_convex_poly_fixed(
 /// 多边形边（对齐 PolyEdge）。
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PolyEdge {
-    y0: i32,
-    y1: i32,
-    x: i64,
-    dx: i64,
-    next: i32, // edges 数组下标，-1 = 空
+    pub(crate) y0: i32,
+    pub(crate) y1: i32,
+    pub(crate) x: i64,
+    pub(crate) dx: i64,
+    pub(crate) next: i32, // edges 数组下标，-1 = 空
 }
 
 /// CollectPolyEdges（对齐 drawing.cpp:1262）。
@@ -1074,7 +1025,10 @@ pub(crate) fn collect_poly_edges(
         }
 
         let mut edge = PolyEdge::default();
-        edge.dx = (pt1c.x - pt0c.x) / (pt1c.y - pt0c.y);
+        #[allow(clippy::field_reassign_with_default)]
+        {
+            edge.dx = (pt1c.x - pt0c.x) / (pt1c.y - pt0c.y);
+        }
         if pt0.y < pt1.y {
             edge.y0 = pt0.y as i32;
             edge.y1 = pt1.y as i32;
@@ -1094,7 +1048,6 @@ pub(crate) fn fill_edge_collection(cv: &mut Canvas, edges: &mut Vec<PolyEdge>) {
     let total = edges.len();
     let size_w = cv.width;
     let size_h = cv.height;
-    let delta = XY_ONE - 1;
 
     if total < 2 {
         return;
@@ -1135,108 +1088,21 @@ pub(crate) fn fill_edge_collection(cv: &mut Canvas, edges: &mut Vec<PolyEdge>) {
 
     // 哨兵（对齐 tmp.next = 0/null：next = -1 表示链表空）
     edges.push(PolyEdge { y0: i32::MAX, next: -1, ..Default::default() });
-    // OpenCV 用指针链表；这里用下标链表：tmp = 哨兵节点下标（total），
-    // next 字段存 edges 下标，-1 = 空
-    let tmp = total as i32; // 哨兵节点下标
-    let mut i = 0usize;
-    let mut e_cur = 0usize;
-    y_max = y_max.min(size_h);
-
-    let mut y = edges[0].y0;
-    while y < y_max {
-        let mut draw = 0;
-        let clipline = y < 0;
-        let mut prelast = tmp;
-        let mut last = edges[tmp as usize].next;
-        let mut keep_prelast;
-
-        loop {
-            let last_valid = last >= 0;
-            let e_y0 = edges[e_cur].y0;
-            if !(last_valid || e_y0 == y) {
-                break;
-            }
-            if last_valid && edges[last as usize].y1 == y {
-                // 排除到达下端点的边
-                let ln = edges[last as usize].next;
-                edges[prelast as usize].next = ln;
-                last = ln;
-                continue;
-            }
-            keep_prelast = prelast;
-            if last_valid && (edges[e_cur].y0 > y || edges[last as usize].x < edges[e_cur].x) {
-                // 活动链表前进
-                prelast = last;
-                last = edges[last as usize].next;
-            } else if i < total {
-                // 插入新边到活动链表
-                edges[prelast as usize].next = e_cur as i32;
-                edges[e_cur].next = last;
-                prelast = e_cur as i32;
-                e_cur += 1;
-                i += 1;
-            } else {
-                break;
-            }
-
-            if draw != 0 {
-                if !clipline {
-                    let (x1, x2);
-                    if edges[keep_prelast as usize].x > edges[prelast as usize].x {
-                        x1 = ((edges[prelast as usize].x + delta) >> XY_SHIFT) as i32;
-                        x2 = (edges[keep_prelast as usize].x >> XY_SHIFT) as i32;
-                    } else {
-                        x1 = ((edges[keep_prelast as usize].x + delta) >> XY_SHIFT) as i32;
-                        x2 = (edges[prelast as usize].x >> XY_SHIFT) as i32;
-                    }
-                    if x1 < size_w && x2 >= 0 {
-                        let x1 = x1.max(0);
-                        let x2 = x2.min(size_w - 1);
-                        cv.hline(y, x1, x2);
-                    }
-                }
-                edges[keep_prelast as usize].x += edges[keep_prelast as usize].dx;
-                edges[prelast as usize].x += edges[prelast as usize].dx;
-            }
-            draw ^= 1;
-        }
-
-        // 冒泡排序活动链表（按 x）
-        let mut keep_prelast_loop: i32 = -1;
-        loop {
-            let mut prelast = tmp;
-            let mut last = edges[tmp as usize].next;
-            let mut last_exchange: i32 = -1;
-
-            while last != keep_prelast_loop && edges[last as usize].next != -1 {
-                let te = edges[last as usize].next;
-                if edges[last as usize].x > edges[te as usize].x {
-                    // swap
-                    edges[prelast as usize].next = te;
-                    edges[last as usize].next = edges[te as usize].next;
-                    edges[te as usize].next = last;
-                    prelast = te;
-                    last_exchange = prelast;
-                } else {
-                    prelast = last;
-                    last = te;
-                }
-            }
-            if last_exchange == -1 {
-                break;
-            }
-            keep_prelast_loop = last_exchange;
-            if keep_prelast_loop == edges[tmp as usize].next || keep_prelast_loop == tmp {
-                break;
-            }
-        }
-
-        y += 1;
-    }
+    // AET 扫描线填充（热循环在 simd_kernels/ 内用 get_unchecked 消除边界检查）
+    crate::simd_kernels::drawing::fill_edges_aet(
+        edges,
+        total,
+        size_w,
+        size_h,
+        |y, x1, x2| cv.hline(y, x1, x2),
+    );
     edges.pop();
 }
 
 /// SinTable（对齐 drawing.cpp:831，450 项，度数索引）。
+// OpenCV sin_table（imgproc/drawing.cpp）逐值复刻，0.7071068 为原表值
+#[allow(clippy::approx_constant)]
+#[allow(clippy::excessive_precision)]
 const SIN_TABLE: [f32; 451] = [
     0.0000000, 0.0174524, 0.0348995, 0.0523360, 0.0697565, 0.0871557,
     0.1045285, 0.1218693, 0.1391731, 0.1564345, 0.1736482, 0.1908090,
@@ -1987,7 +1853,7 @@ mod tests {
         line(&mut img, Point::new(1, 1), Point::new(6, 4), [255], 1, LineType::Connected8, 0);
         let d = img.data();
         // 端点必画；8 连通 dx=5 > dy=3 → 6 个点（dx+1）
-        assert_eq!(d[1 * 8 + 1], 255, "起点");
+        assert_eq!(d[8 + 1], 255, "起点");
         assert_eq!(d[4 * 8 + 6], 255, "终点");
         let count: usize = d.iter().filter(|&&v| v == 255).count();
         assert_eq!(count, 6);

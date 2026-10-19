@@ -23,6 +23,12 @@ pub trait Pixel: Copy + Send + Sync + 'static + PartialOrd {
 
     /// 从 `f32` 转换，round-to-nearest、ties-to-even，越界饱和。
     fn from_f32(v: f32) -> Self;
+
+    /// 从 `f64` 转换，round-to-nearest、ties-to-even，越界饱和。
+    ///
+    /// 对齐 OpenCV `saturate_cast<T>(double)`（cvRound 语义），
+    /// 用于 f64 全程累加的标量路径（box_filter CV_32S 等）。
+    fn from_f64_round_even(v: f64) -> Self;
 }
 
 impl Pixel for u8 {
@@ -42,6 +48,10 @@ impl Pixel for u8 {
 
     fn from_f32(v: f32) -> Self {
         v.round_ties_even() as u8
+    }
+
+    fn from_f64_round_even(v: f64) -> Self {
+        v.round_ties_even().clamp(0.0, 255.0) as u8
     }
 }
 
@@ -63,6 +73,10 @@ impl Pixel for u16 {
     fn from_f32(v: f32) -> Self {
         v.round_ties_even() as u16
     }
+
+    fn from_f64_round_even(v: f64) -> Self {
+        v.round_ties_even().clamp(0.0, 65535.0) as u16
+    }
 }
 
 impl Pixel for f32 {
@@ -81,6 +95,34 @@ impl Pixel for f32 {
     }
 
     fn from_f32(v: f32) -> Self {
+        v
+    }
+
+    fn from_f64_round_even(v: f64) -> Self {
+        v as f32
+    }
+}
+
+impl Pixel for f64 {
+    type Simd = f64;
+
+    fn zero() -> Self {
+        0.0
+    }
+
+    fn max_value() -> Self {
+        1.0
+    }
+
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+
+    fn from_f32(v: f32) -> Self {
+        v as f64
+    }
+
+    fn from_f64_round_even(v: f64) -> Self {
         v
     }
 }
@@ -103,6 +145,10 @@ impl Pixel for i16 {
     fn from_f32(v: f32) -> Self {
         v.round_ties_even() as i16
     }
+
+    fn from_f64_round_even(v: f64) -> Self {
+        v.round_ties_even().clamp(-32768.0, 32767.0) as i16
+    }
 }
 
 impl Pixel for i32 {
@@ -122,6 +168,10 @@ impl Pixel for i32 {
 
     fn from_f32(v: f32) -> Self {
         v.round_ties_even() as i32
+    }
+
+    fn from_f64_round_even(v: f64) -> Self {
+        v.round_ties_even().clamp(i32::MIN as f64, i32::MAX as f64) as i32
     }
 }
 

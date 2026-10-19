@@ -59,6 +59,13 @@ cargo run --release --example compare -- \
 # 4. 算 PSNR（DTYPE 环境变量指定像素类型，默认 u8）
 echo "[compare] computing PSNR ..."
 DTYPE="${DTYPE:-u8}"
-python3 "${ROOT}/scripts/psnr.py" "${REF_OUT}" "${RUST_OUT}" --dtype "${DTYPE}"
+REL_FLAG=""
+# matchTemplate 非归一化方法（0/2/4）输出大数值，用相对误差评估
+if [[ "${FUNC}" == "match_template" && "${DTYPE}" == "f32" ]]; then
+    case "$1" in
+        0|2|4) REL_FLAG="--rel" ;;
+    esac
+fi
+python3 "${ROOT}/scripts/psnr.py" "${REF_OUT}" "${RUST_OUT}" --dtype "${DTYPE}" ${REL_FLAG}
 
 echo "[compare] done. ref=${REF_OUT} rust=${RUST_OUT}"

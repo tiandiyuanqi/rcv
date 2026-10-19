@@ -39,6 +39,39 @@ pub fn find_end_contour_point(row: &[u8], j: usize) -> usize {
     }
 }
 
+/// 单趟扫描一行，返回所有 run 边界（对齐 OpenCV TRU 的 findStart/findEnd
+/// 交替扫描，但消除逐 run 分支预测抖动）。
+pub fn scan_row_runs(row: &[u8], starts: &mut Vec<u32>, ends: &mut Vec<u32>) {
+    match crate::simd_kernels::x86::isa() {
+        crate::simd_kernels::x86::Isa::Avx512 => unsafe {
+            crate::simd_kernels::x86::avx512::scan_row_runs(row, starts, ends)
+        },
+        crate::simd_kernels::x86::Isa::Avx2 => unsafe {
+            crate::simd_kernels::x86::avx2::scan_row_runs(row, starts, ends)
+        },
+        _ => {
+            // 标量/AVX2 回退：逐 run 扫描
+            starts.clear();
+            ends.clear();
+            let width = row.len();
+            let mut c = 1usize;
+            while c < width - 1 {
+                c = find_start_contour_point(row, c);
+                if c >= width - 1 {
+                    break;
+                }
+                let s = c as u32;
+                c = find_end_contour_point(row, c + 1);
+                if c >= width {
+                    break;
+                }
+                starts.push(s);
+                ends.push(c as u32);
+            }
+        }
+    }
+}
+
 /// Suzuki findNextX：行内找第一个与 `prev` 不同的像素（对齐
 /// contours_new.cpp:586 标量路径）。
 ///
@@ -115,6 +148,94 @@ pub struct TruAccumulator {
     pub idx_external_firstline: Vec<usize>,
 }
 
+/// 分块点缓冲（对齐 OpenCV `TRUCOPagedContour`）。
+///
+/// 热循环 `push_back` 仅做指针比较 + 存储（无计数器、无容量检查），
+/// 块满时分配新块。`to_vec` 用块级 memcpy 输出，避免逐点 push。
+struct PagedBuffer {
+    blocks: Vec<Box<[Point; BLOCK_SIZE]>>,
+    /// 当前块索引。
+    block_idx: usize,
+    /// 当前块内已用点数。
+    count: usize,
+}
+
+const BLOCK_SIZE: usize = 4096;
+
+impl PagedBuffer {
+    #[inline]
+    fn new() -> Self {
+        let mut blocks = Vec::with_capacity(4);
+        blocks.push(Box::new([Point::new(0, 0); BLOCK_SIZE]));
+        Self { blocks, block_idx: 0, count: 0 }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.block_idx = 0;
+        self.count = 0;
+    }
+
+    #[inline]
+    fn push(&mut self, p: Point) {
+        if self.count == BLOCK_SIZE {
+            self.block_idx += 1;
+            if self.block_idx == self.blocks.len() {
+                self.blocks.push(Box::new([Point::new(0, 0); BLOCK_SIZE]));
+            }
+            self.count = 0;
+        }
+        self.blocks[self.block_idx][self.count] = p;
+        self.count += 1;
+    }
+
+    #[inline]
+    fn pop(&mut self) {
+        if self.count == 0 {
+            if self.block_idx == 0 {
+                return;
+            }
+            self.block_idx -= 1;
+            self.count = BLOCK_SIZE;
+        }
+        self.count -= 1;
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.block_idx * BLOCK_SIZE + self.count
+    }
+
+    #[inline]
+    fn first(&self) -> Point {
+        self.blocks[0][0]
+    }
+
+    #[inline]
+    fn last(&self) -> Point {
+        if self.count == 0 {
+            self.blocks[self.block_idx - 1][BLOCK_SIZE - 1]
+        } else {
+            self.blocks[self.block_idx][self.count - 1]
+        }
+    }
+
+    /// 块级 memcpy 输出到 `Vec<Point>`（对齐 `copyTo`）。
+    fn to_vec(&self) -> Vec<Point> {
+        let total = self.len();
+        let mut out = Vec::with_capacity(total);
+        // 完整块
+        for b in &self.blocks[..self.block_idx] {
+            out.extend_from_slice(&b[..]);
+        }
+        // 最后部分块
+        if self.count > 0 {
+            out.extend_from_slice(&self.blocks[self.block_idx][..self.count]);
+        }
+        out
+    }
+}
+
 /// 邻居偏移（对齐 offsets_[16]：idx ∈ [0, 16)）。
 #[inline(always)]
 fn tru_offset(idx: i32, stride: isize) -> isize {
@@ -139,7 +260,7 @@ unsafe fn tru_trace_contour(
     c: i32,
     row_start: i32,
     is_external: bool,
-    buffer: &mut Vec<Point>,
+    buffer: &mut PagedBuffer,
 ) -> bool {
     // SAFETY: pad 哨兵圈 + 调用方契约保证所有偏移在 img 内
     unsafe {
@@ -185,7 +306,6 @@ unsafe fn tru_trace_contour(
 
     loop {
         buffer.push(Point::new(curr_x - 1, curr_y - 1));
-        // 检查 8 邻域
         let mut dir = -1;
         for n in 0..8 {
             let idx = search_idx + n;
@@ -280,6 +400,7 @@ unsafe fn tru_trace_external_mock(img: &mut [u8], stride: usize, r: i32, c: i32,
             if curr_y < row_start {
                 return;
             }
+            #[allow(clippy::collapsible_if)]
             if curr == start {
                 if !is_first_move && dir == start_dir {
                     return;
@@ -315,50 +436,49 @@ unsafe fn tru_process_stripe(
     // SAFETY: pad 哨兵圈 + 调用方契约保证所有偏移在 img 内
     unsafe {
     let mut acc = TruAccumulator::default();
-    let mut buffer: Vec<Point> = Vec::new();
+    // 分块缓冲（对齐 TRUCOPagedContour）：热循环 push 仅指针比较 + 存储
+    let mut buffer = PagedBuffer::new();
     let cols = stride;
+    // 单趟扫描缓冲（复用，避免逐 run 分支预测抖动）
+    let mut run_starts: Vec<u32> = Vec::with_capacity(512);
+    let mut run_ends: Vec<u32> = Vec::with_capacity(512);
 
     for r in row_start..=row_end {
         let row_off = r as usize * stride;
-        let mut c: i32 = 1;
-        while (c as usize) < cols - 1 {
-            // 1. 跳过背景（SIMD）
-            c = find_start_contour_point(&img[row_off..row_off + cols], c as usize) as i32;
-            if c as usize >= cols - 1 {
-                break;
-            }
+        // 单趟扫描：一次 AVX512 块扫描找出所有 run 边界
+        scan_row_runs(&img[row_off..row_off + cols], &mut run_starts, &mut run_ends);
 
-            // 2. 外轮廓（FOREGROUND 且非末行）
+        for i in 0..run_starts.len() {
+            let c = run_starts[i] as i32;
+            let c_end = run_ends[i] as i32;
+
+            // 外轮廓（FOREGROUND 且非末行）
             if img[row_off + c as usize] == TRU_FOREGROUND && r < row_end {
                 if tru_trace_contour(img, stride, r, c, row_start, true, &mut buffer) {
-                    if buffer.len() > 1 && buffer[buffer.len() - 1] == buffer[0] {
+                    if buffer.len() > 1 && buffer.last() == buffer.first() {
                         buffer.pop();
                     }
                     if r == row_start {
                         acc.idx_external_firstline.push(acc.contours.len());
                     }
-                    acc.contours.push(std::mem::take(&mut buffer));
+                    acc.contours.push(buffer.to_vec());
                 }
             } else if img[row_off + c as usize] == TRU_FOREGROUND && r == row_end {
                 // 末行：只标 EAST，让内轮廓提取正确
                 tru_trace_external_mock(img, stride, r, c, row_start);
             }
 
-            // 3. 跳到当前连通域末尾（SIMD）
-            c = find_end_contour_point(&img[row_off..row_off + cols], (c + 1) as usize) as i32;
-            if c as usize >= cols {
-                break;
-            }
             // 内轮廓（对齐 truco:356：row_ptr[c-1] > VISITED_OUTER_RIGHT 且非首行）
-            if img[row_off + c as usize - 1] > TRU_VISITED_OUTER_RIGHT && r > row_start {
-                if tru_trace_contour(img, stride, r, c - 1, row_start, false, &mut buffer) {
-                    if buffer.len() > 1 && buffer[buffer.len() - 1] == buffer[0] {
+            #[allow(clippy::collapsible_if)]
+            if img[row_off + c_end as usize - 1] > TRU_VISITED_OUTER_RIGHT && r > row_start {
+                if tru_trace_contour(img, stride, r, c_end - 1, row_start, false, &mut buffer) {
+                    if buffer.len() > 1 && buffer.last() == buffer.first() {
                         buffer.pop();
                     }
                     if r == row_end {
                         acc.idx_internal_lastline.push(acc.contours.len());
                     }
-                    acc.contours.push(std::mem::take(&mut buffer));
+                    acc.contours.push(buffer.to_vec());
                 }
             }
         }
@@ -398,9 +518,9 @@ pub fn tru_process_stripes(
             let ptr = ptr;
             // SAFETY: img 长度 = ph * pw（调用方契约）；条带行区间
             // [rs, re] 在 padded 图内，跟踪由 pad 哨兵圈保护
-            let mut sub = unsafe { std::slice::from_raw_parts_mut(ptr.0, ph * pw) };
+            let sub = unsafe { std::slice::from_raw_parts_mut(ptr.0, ph * pw) };
             // SAFETY: 同上
-            unsafe { tru_process_stripe(&mut sub, pw, rs, re) }
+            unsafe { tru_process_stripe(sub, pw, rs, re) }
         })
         .collect()
 }
@@ -473,6 +593,7 @@ pub fn approximate_chain_tc89(
             let mut skip = false;
             let mut new_start_idx = 0usize;
             let len = ares.len();
+            #[allow(clippy::collapsible_if)]
             if ares[0].s != 0 && ares[len - 1].s != 0 {
                 if !calc_new_start(&mut ares, &mut new_start_idx) {
                     skip = true;

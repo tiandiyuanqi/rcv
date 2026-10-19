@@ -10,7 +10,7 @@
 
 mod core;
 mod imgcodecs;
-mod imgproc;
+pub mod imgproc;
 pub mod simd_kernels;
 
 pub use crate::core::border::BorderPolicy;
@@ -23,9 +23,11 @@ pub use crate::imgcodecs::{
 };
 pub use crate::imgproc::bitwise::{bitwise_and, bitwise_not, bitwise_or, bitwise_xor};
 pub use crate::imgproc::color::{to_grayscale, to_rgb};
+pub use crate::imgproc::cvt_color::{ColorConversion, cvt_color, cvt_color_rgba};
 pub use crate::imgproc::connected_components::{
-    CCStat, Connectivity, ConnectedComponents, connected_components, connected_components_with_stats,
+    ConnectedComponents, Connectivity, connected_components, connected_components_with_stats,
 };
+pub use crate::imgproc::distance::{DistanceMask, DistanceType, distance_transform};
 pub use crate::imgproc::contours::{
     ContourApproxMethod, ContourRetrievalMode, Hierarchy, approx_poly_dp, bounding_rect,
     contour_area, find_contours, find_contours_with_hierarchy,
@@ -37,11 +39,22 @@ pub use crate::imgproc::drawing::{
 };
 pub use crate::imgproc::edges::{ApertureSize, canny};
 pub use crate::imgproc::filter::{bilateral_filter, box_filter, gaussian_blur, median_blur};
+pub use crate::imgproc::filter2d::{BorderType, filter2d, sep_filter2d};
+pub use crate::imgproc::flood_fill::{FloodFillResult, flood_fill, flood_fill_grad};
 pub use crate::imgproc::geometry::{
     RotatedRect, arc_length, box_points, convex_hull, is_contour_convex, min_area_rect,
-    min_enclosing_circle,
+    min_enclosing_circle, point_polygon_test,
 };
 pub use crate::imgproc::gradient::{cart_to_polar, laplacian, magnitude, phase, scharr, sobel, sobel5};
+pub use crate::imgproc::histogram::{HistCompMethod, calc_hist, compare_hist, equalize_hist};
+pub use crate::imgproc::integral::{integral, integral_sqsum};
+pub use crate::imgproc::match_template::{TemplateMatchMethod, match_template};
 pub use crate::imgproc::morphology::{dilate, erode, morph_close, morph_gradient, morph_open};
+pub use crate::imgproc::moments::{ContourMatchMethod, Moments, hu_moments, match_shapes, moments};
 pub use crate::imgproc::threshold::{AdaptiveMethod, ThresholdType, adaptive_threshold, threshold};
+pub use crate::imgproc::text::{get_text_size, put_text, put_text_rgb};
+pub use crate::imgproc::warp::{
+    AffineMatrix, DSize, Interpolation, PerspectiveMatrix, WarpBorder, get_rotation_matrix_2d,
+    resize, warp_affine, warp_perspective,
+};
 

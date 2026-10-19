@@ -4,6 +4,7 @@
 
 pub mod avx2;
 pub mod avx512;
+pub mod warp;
 
 use std::sync::OnceLock;
 

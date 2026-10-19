@@ -51,7 +51,7 @@ pub fn tru_find_contours(
 
     // 条带数（对齐 nstripes = getNumThreads()）。共享机器上
     // 过多条带（每条带仅 16 行）导致争抢 + 合并开销，钳制上限
-    let nstripes = rayon::current_num_threads().max(1).min(8);
+    let nstripes = rayon::current_num_threads().clamp(1, 8);
     let mut out = tru_impl(&mut img, pw, ph, nstripes, method);
 
     // offset 平移

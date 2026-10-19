@@ -31,11 +31,13 @@ struct CannyPool {
 }
 
 thread_local! {
-    static CANNY_TLS: std::cell::RefCell<CannyPool> = std::cell::RefCell::new(CannyPool {
-        map: Vec::new(),
-        mag: Vec::new(),
-        stack: Vec::new(),
-    });
+    static CANNY_TLS: std::cell::RefCell<CannyPool> = const {
+        std::cell::RefCell::new(CannyPool {
+            map: Vec::new(),
+            mag: Vec::new(),
+            stack: Vec::new(),
+        })
+    };
 }
 
 /// Sobel 核阶数（aperture_size）：3 = Sobel 3×3（默认），5 = Sobel 5×5，

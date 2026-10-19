@@ -13,9 +13,16 @@ use std::mem::MaybeUninit;
 pub mod bilateral;
 pub mod box_filter;
 pub mod contours;
+pub mod cvt_color;
+pub mod drawing;
 pub mod edges;
+pub mod fft;
+pub mod filter2d;
+pub mod match_template;
 pub mod gaussian;
 pub mod gradient;
+pub mod histogram;
+pub mod integral;
 pub mod median;
 pub mod morphology;
 pub mod scalar;
@@ -46,6 +53,24 @@ pub fn alloc_uninit<T: Copy + 'static>(len: usize) -> Vec<T> {
     }
 }
 
+/// 分配 64 字节对齐的未初始化缓冲（非临时存储 `_mm512_stream_*` 需要）。
+///
+/// 返回 `(Vec<T>, 对齐起始偏移)`：`vec[offset..offset+len]` 起始地址 64 字节对齐。
+/// 调用方只使用 `vec[offset..offset+len]`，其余为填充。
+///
+/// # Safety（调用方契约）
+/// 返回的 Vec 内容未初始化，调用方必须完全覆写后才能读取。
+pub fn alloc_uninit_aligned64<T: Copy + 'static>(len: usize) -> (Vec<T>, usize) {
+    // 64 字节对齐需要最多 64/T 个元素填充
+    let pad = 64 / std::mem::size_of::<T>();
+    let total = len + pad;
+    let mut v = alloc_uninit::<T>(total);
+    let base = v.as_ptr() as usize;
+    let offset = (64 - (base & 63)) & 63;
+    let offset_elems = offset / std::mem::size_of::<T>();
+    (v, offset_elems)
+}
+
 /// RGB u8 → 灰度 u8（运行时派发：AVX512 → AVX2 → 标量）。
 ///
 /// `src` 为 RGB 交错（每像素 3 字节），`dst` 为灰度（每像素 1 字节），`n` 为像素数。
@@ -63,8 +88,20 @@ pub fn to_grayscale_u8(src: &[u8], dst: &mut [u8], n: usize) {
 /// `t`/`mv` 为整数化后的阈值/最大值，`n` 为元素数。
 pub fn threshold_u8(src: &[u8], dst: &mut [u8], n: usize, t: u8, mv: u8, type_: u8) {
     match x86::isa() {
-        x86::Isa::Avx512 => unsafe { x86::avx512::threshold_u8(src, dst, n, t, mv, type_) },
-        x86::Isa::Avx2 => unsafe { x86::avx2::threshold_u8(src, dst, n, t, mv, type_) },
+        x86::Isa::Avx512 => {
+            if type_ == 0 {
+                unsafe { x86::avx512::threshold_binary_u8(src, dst, n, t, mv) }
+            } else {
+                unsafe { x86::avx512::threshold_u8(src, dst, n, t, mv, type_) }
+            }
+        }
+        x86::Isa::Avx2 => {
+            if type_ == 0 {
+                unsafe { x86::avx2::threshold_binary_u8(src, dst, n, t, mv) }
+            } else {
+                unsafe { x86::avx2::threshold_u8(src, dst, n, t, mv, type_) }
+            }
+        }
         x86::Isa::Scalar => scalar::threshold_u8(src, dst, n, t, mv, type_),
     }
 }
@@ -120,6 +157,253 @@ pub fn box_row_sum_u8_direct_cn(
             x86::avx2::box_row_sum_u8_direct_cn(src, dst, w, kw, cn, border)
         },
         x86::Isa::Scalar => box_filter::box_row_sum_u8_direct_cn(src, dst, w, kw, cn, border),
+    }
+}
+
+/// 3×3 距离变换前向扫描（AVX512 向量化 top 行 min + 标量 left 修复）。
+///
+/// 见 `avx512::dist_forward_3x3` 契约。运行时派发（AVX512 → 标量）。
+pub fn dist_forward_3x3(
+    temp: &mut [u32],
+    s: &[u8],
+    w: usize,
+    step: usize,
+    row: usize,
+    border: usize,
+    hv_dist: u32,
+    diag_dist: u32,
+    dist_max: u32,
+) {
+    match x86::isa() {
+        x86::Isa::Avx512 => unsafe {
+            x86::avx512::dist_forward_3x3(temp, s, w, step, row, border, hv_dist, diag_dist, dist_max)
+        },
+        x86::Isa::Avx2 => unsafe {
+            x86::avx2::dist_forward_3x3(temp, s, w, step, row, border, hv_dist, diag_dist, dist_max)
+        },
+        _ => {
+            // 标量 fallback（与 distance.rs 内联逻辑一致）
+            let mut left = dist_max;
+            for j in 0..w {
+                let idx = row + border + j;
+                if s[j] == 0 {
+                    temp[idx] = 0;
+                    left = 0;
+                } else {
+                    let t0 = temp[idx - step - 1].wrapping_add(diag_dist);
+                    let t1 = temp[idx - step].wrapping_add(hv_dist);
+                    let t2 = temp[idx - step + 1].wrapping_add(diag_dist);
+                    let t3 = left.wrapping_add(hv_dist);
+                    let mut m = t0.min(t1);
+                    m = m.min(t2);
+                    m = m.min(t3);
+                    temp[idx] = if m > dist_max { dist_max } else { m };
+                    left = temp[idx];
+                }
+            }
+        }
+    }
+}
+
+/// 5×5 距离变换前向扫描（AVX512 向量化 top1/top2 行 min + 标量 left1/left2 修复）。
+///
+/// 见 `avx512::dist_forward_5x5` 契约。运行时派发（AVX512 → 标量）。
+pub fn dist_forward_5x5(
+    temp: &mut [u32],
+    s: &[u8],
+    w: usize,
+    step: usize,
+    row: usize,
+    border: usize,
+    hv_dist: u32,
+    diag_dist: u32,
+    long_dist: u32,
+    dist_max: u32,
+) {
+    match x86::isa() {
+        x86::Isa::Avx512 => unsafe {
+            x86::avx512::dist_forward_5x5(
+                temp, s, w, step, row, border, hv_dist, diag_dist, long_dist, dist_max,
+            )
+        },
+        x86::Isa::Avx2 => unsafe {
+            x86::avx2::dist_forward_5x5(
+                temp, s, w, step, row, border, hv_dist, diag_dist, long_dist, dist_max,
+            )
+        },
+        _ => {
+            let mut left1 = dist_max;
+            let mut left2 = dist_max;
+            for j in 0..w {
+                let idx = row + border + j;
+                if s[j] == 0 {
+                    temp[idx] = 0;
+                    left1 = 0;
+                    left2 = 0;
+                } else {
+                    let mut t0 = temp[idx - 2 * step - 1].wrapping_add(long_dist);
+                    let mut t = temp[idx - 2 * step + 1].wrapping_add(long_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx - step - 2].wrapping_add(long_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx - step - 1].wrapping_add(diag_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx - step].wrapping_add(hv_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx - step + 1].wrapping_add(diag_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx - step + 2].wrapping_add(long_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = left1.wrapping_add(hv_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    temp[idx] = if t0 > dist_max { dist_max } else { t0 };
+                    left2 = left1;
+                    left1 = temp[idx];
+                }
+            }
+        }
+    }
+}
+
+/// 5×5 距离变换后向扫描（AVX512 向量化 bot1/bot2 行 min + 标量 right 修复 + 定点→浮点）。
+///
+/// 见 `avx512::dist_backward_5x5` 契约。运行时派发（AVX512 → 标量）。
+pub fn dist_backward_5x5(
+    temp: &mut [u32],
+    drow: &mut [f32],
+    w: usize,
+    step: usize,
+    row: usize,
+    border: usize,
+    hv_dist: u32,
+    diag_dist: u32,
+    long_dist: u32,
+    dist_max: u32,
+    scale: f32,
+) {
+    match x86::isa() {
+        x86::Isa::Avx512 => unsafe {
+            x86::avx512::dist_backward_5x5(
+                temp, drow, w, step, row, border, hv_dist, diag_dist, long_dist, dist_max, scale,
+            )
+        },
+        x86::Isa::Avx2 => unsafe {
+            x86::avx2::dist_backward_5x5(
+                temp, drow, w, step, row, border, hv_dist, diag_dist, long_dist, dist_max, scale,
+            )
+        },
+        _ => {
+            let mut right = dist_max;
+            for j in (0..w).rev() {
+                let idx = row + border + j;
+                let mut t0 = temp[idx];
+                if t0 > hv_dist {
+                    let mut t = temp[idx + 2 * step + 1].wrapping_add(long_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx + 2 * step - 1].wrapping_add(long_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx + step + 2].wrapping_add(long_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx + step + 1].wrapping_add(diag_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx + step].wrapping_add(hv_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx + step - 1].wrapping_add(diag_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = temp[idx + step - 2].wrapping_add(long_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    t = right.wrapping_add(hv_dist);
+                    if t < t0 {
+                        t0 = t;
+                    }
+                    temp[idx] = t0;
+                }
+                right = temp[idx];
+            }
+            for j in 0..w {
+                drow[j] = temp[row + border + j] as f32 * scale;
+            }
+        }
+    }
+}
+
+/// 3×3 距离变换后向扫描（AVX512 向量化 bottom 行 min + 标量 right 修复 + 定点→浮点）。
+///
+/// 见 `avx512::dist_backward_3x3` 契约。运行时派发（AVX512 → 标量）。
+pub fn dist_backward_3x3(
+    temp: &mut [u32],
+    drow: &mut [f32],
+    w: usize,
+    step: usize,
+    row: usize,
+    border: usize,
+    hv_dist: u32,
+    diag_dist: u32,
+    dist_max: u32,
+    scale: f32,
+) {
+    match x86::isa() {
+        x86::Isa::Avx512 => unsafe {
+            x86::avx512::dist_backward_3x3(
+                temp, drow, w, step, row, border, hv_dist, diag_dist, dist_max, scale,
+            )
+        },
+        x86::Isa::Avx2 => unsafe {
+            x86::avx2::dist_backward_3x3(
+                temp, drow, w, step, row, border, hv_dist, diag_dist, dist_max, scale,
+            )
+        },
+        _ => {
+            let mut right = temp[row + border + w];
+            for j in (0..w).rev() {
+                let idx = row + border + j;
+                let t0 = temp[idx];
+                if t0 > hv_dist {
+                    let b1 = temp[idx + step + 1].wrapping_add(diag_dist);
+                    let b2 = temp[idx + step].wrapping_add(hv_dist);
+                    let b3 = temp[idx + step - 1].wrapping_add(diag_dist);
+                    let r = right.wrapping_add(hv_dist);
+                    let mut t = b1.min(b2);
+                    t = t.min(b3);
+                    t = t.min(r);
+                    if t < t0 {
+                        temp[idx] = t;
+                    }
+                }
+                right = temp[idx];
+            }
+            for j in 0..w {
+                drow[j] = temp[row + border + j] as f32 * scale;
+            }
+        }
     }
 }
 
@@ -645,4 +929,283 @@ pub fn bitwise_not_bytes(a: &[u8], dst: &mut [u8], n: usize) {
 /// `labels` 的每个元素必须是 `p` 的合法下标（`0 <= v < p.len()`）。
 pub fn cc_relabel_inplace(labels: &mut [i32], p: &[i32]) {
     scalar::cc_relabel_inplace(labels, p);
+}
+
+/// HResize LINEAR（u8 → i32 缓冲，扁平域 `[start, end)`，运行时派发）。
+///
+/// 对齐 OpenCV `HResizeLinear<uchar,int,short>`：`D[dx] = S[xofs[dx]]*a0 + S[xofs[dx]+cn]*a1`。
+pub fn hresize_linear_u8(
+    src: &[u8],
+    xofs: &[i32],
+    ialpha: &[i16],
+    dst: &mut [i32],
+    start: usize,
+    end: usize,
+    cn: usize,
+    srow_len: usize,
+) {
+    match x86::isa() {
+        x86::Isa::Avx512 | x86::Isa::Avx2 => unsafe {
+            x86::warp::hresize_linear_u8(src, xofs, ialpha, dst, start, end, cn, srow_len)
+        },
+        x86::Isa::Scalar => {
+            for dx in start..end {
+                let sx = xofs[dx] as usize;
+                dst[dx] = src[sx] as i32 * ialpha[dx * 2] as i32
+                    + src[sx + cn] as i32 * ialpha[dx * 2 + 1] as i32;
+            }
+        }
+    }
+}
+
+/// VResize LINEAR（i32 缓冲 → u8，运行时派发）。
+///
+/// 对齐 OpenCV `VResizeLinear<uchar,int,short,FixedPtCast>`：
+/// `dst[x] = sat_u8(((b0*(S0>>4))>>16 + (b1*(S1>>4))>>16 + 2)>>2)`。
+pub fn vresize_linear_u8(s0: &[i32], s1: &[i32], dst: &mut [u8], b0: i16, b1: i16, width: usize) {
+    match x86::isa() {
+        x86::Isa::Avx512 | x86::Isa::Avx2 => unsafe {
+            x86::warp::vresize_linear_u8(s0, s1, dst, b0, b1, width)
+        },
+        x86::Isa::Scalar => {
+            for x in 0..width {
+                let v = ((b0 as i32 * (s0[x] >> 4)) >> 16) + ((b1 as i32 * (s1[x] >> 4)) >> 16) + 2;
+                dst[x] = ((v >> 2).clamp(0, 255)) as u8;
+            }
+        }
+    }
+}
+
+/// 2×2 area-fast 缩小（cn=1，运行时派发）。
+///
+/// 对齐 OpenCV `ResizeAreaFastVec_SIMD_8u`：`(S0[2dx]+S0[2dx+1]+S1[2dx]+S1[2dx+1]+2)>>2`。
+pub fn area_fast_2x2_cn1(src: &[u8], dst: &mut [u8], sw: usize, dw: usize, dh: usize) {
+    match x86::isa() {
+        x86::Isa::Avx512 | x86::Isa::Avx2 => unsafe {
+            x86::warp::area_fast_2x2_cn1(src, dst, sw, dw, dh)
+        },
+        x86::Isa::Scalar => {
+            for dy in 0..dh {
+                let s0 = &src[dy * 2 * sw..];
+                let s1 = &src[(dy * 2 + 1) * sw..];
+                let drow = &mut dst[dy * dw..];
+                for dx in 0..dw {
+                    let i = dx * 2;
+                    drow[dx] = ((s0[i] as u32 + s0[i + 1] as u32 + s1[i] as u32 + s1[i + 1] as u32 + 2) >> 2) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// 2×2 area-fast 缩小（cn=3，运行时派发）。
+///
+/// 对齐 OpenCV `ResizeAreaFastVec_SIMD_8u`：`(S0[2dx*3+k]+S0[2dx*3+3+k]+S1[2dx*3+k]+S1[2dx*3+3+k]+2)>>2`。
+pub fn area_fast_2x2_cn3(src: &[u8], dst: &mut [u8], sw: usize, dw: usize, dh: usize) {
+    match x86::isa() {
+        x86::Isa::Avx512 | x86::Isa::Avx2 => unsafe {
+            x86::warp::area_fast_2x2_cn3(src, dst, sw, dw, dh)
+        },
+        x86::Isa::Scalar => {
+            for dy in 0..dh {
+                let s0 = &src[dy * 2 * sw * 3..];
+                let s1 = &src[(dy * 2 + 1) * sw * 3..];
+                let drow = &mut dst[dy * dw * 3..];
+                for dx in 0..dw {
+                    let i = dx * 6;
+                    for k in 0..3 {
+                        drow[dx * 3 + k] = ((s0[i + k] as u32 + s0[i + 3 + k] as u32 + s1[i + k] as u32
+                            + s1[i + 3 + k] as u32
+                            + 2)
+                            >> 2) as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// HResize CUBIC（u8 → i32 缓冲，扁平域 `[start, end)`，运行时派发）。
+///
+/// 对齐 OpenCV `HResizeCubic<uchar,int,short>`：`D[dx] = Σ S[sx+j*C] * ialpha[dx*4+j]`。
+/// `ialpha01`/`ialpha23` 为预交错布局（扁平域 [a0,a1]/[a2,a3] 对，SIMD madd 用）。
+/// 帧级检测：xofs 是否为 cn=3、stride=6 等距模式（scale=2 下采样）。
+/// VBMI HResize 快路径前置条件；每帧调用一次（xofs 帧内不变），
+/// 避免逐行重复检测。
+pub fn hresize_cubic_vbmi_pattern(xofs: &[i32], cn: usize, end: usize) -> bool {
+    if cn != 3 || end < 16 {
+        return false;
+    }
+    let npix = end / 3;
+    npix >= 2
+        && xofs[3] - xofs[0] == 6
+        && (1..npix).all(|p| xofs[p * 3] - xofs[(p - 1) * 3] == 6)
+        && (0..npix).all(|p| xofs[p * 3 + 2] - xofs[p * 3] == 2)
+}
+
+/// HResize CUBIC VBMI 快路径（无检测版，调用方已用
+/// [`hresize_cubic_vbmi_pattern`] 确认模式）。
+///
+/// # Safety（内部已校验）
+/// - xofs 满足 stride=6 等距模式（调用方保证）；CPU 支持探测在内部完成
+pub fn hresize_cubic_vbmi(
+    src: &[u8],
+    xofs: &[i32],
+    ialpha: &[i16],
+    ialpha01: &[i16],
+    ialpha23: &[i16],
+    dst: &mut [i32],
+    start: usize,
+    end: usize,
+    cn: usize,
+    srow_len: usize,
+) {
+    static VBMI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *VBMI.get_or_init(|| std::arch::is_x86_feature_detected!("avx512vbmi")) {
+        unsafe {
+            x86::warp::hresize_cubic_vbmi_regular(
+                src, xofs, ialpha, ialpha01, ialpha23, dst, start, end, cn, srow_len,
+            )
+        }
+    } else {
+        // 无 VBMI 时回退 AVX2/标量路径
+        hresize_cubic_u8(src, xofs, ialpha, ialpha01, ialpha23, dst, start, end, cn, srow_len);
+    }
+}
+
+pub fn hresize_cubic_u8(
+    src: &[u8],
+    xofs: &[i32],
+    ialpha: &[i16],
+    ialpha01: &[i16],
+    ialpha23: &[i16],
+    dst: &mut [i32],
+    start: usize,
+    end: usize,
+    cn: usize,
+    srow_len: usize,
+) {
+    // AVX512VBMI 快路径（cn=3、stride=6 等距模式；探测一次缓存）
+    static VBMI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *VBMI.get_or_init(|| std::arch::is_x86_feature_detected!("avx512vbmi")) {
+        let handled = unsafe {
+            x86::warp::hresize_cubic_vbmi_u8(
+                src, xofs, ialpha, ialpha01, ialpha23, dst, start, end, cn, srow_len,
+            )
+        };
+        if handled {
+            return;
+        }
+    }
+    match x86::isa() {
+        x86::Isa::Avx512 | x86::Isa::Avx2 => unsafe {
+            x86::warp::hresize_cubic_u8(
+                src, xofs, ialpha, ialpha01, ialpha23, dst, start, end, cn, srow_len,
+            )
+        },
+        x86::Isa::Scalar => {
+            for dx in start..end {
+                let sx = xofs[dx] as usize - cn;
+                let mut v: i32 = 0;
+                for j in 0..4 {
+                    let idx = sx + j * cn;
+                    let sval = if idx < srow_len { src[idx] as i32 } else { 0 };
+                    v += sval * ialpha[dx * 4 + j] as i32;
+                }
+                dst[dx] = v;
+            }
+        }
+    }
+}
+
+/// VResize CUBIC（i32 缓冲 → u8，运行时派发）。
+///
+/// 对齐 OpenCV `VResizeCubicVec_32s8u`：f32 分离乘加链 + v_round + 饱和 pack。
+pub fn vresize_cubic_u8(
+    s0: &[i32],
+    s1: &[i32],
+    s2: &[i32],
+    s3: &[i32],
+    dst: &mut [u8],
+    b: [i32; 4],
+    scale: f32,
+    width: usize,
+) {
+    // AVX512 版（与 VBMI HResize 配对，避免 AVX512/AVX2 混用切换 penalty）
+    static AVX512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *AVX512.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw")
+    }) {
+        return unsafe { x86::warp::vresize_cubic_avx512_u8(s0, s1, s2, s3, dst, b, scale, width) };
+    }
+    match x86::isa() {
+        x86::Isa::Avx512 | x86::Isa::Avx2 => unsafe {
+            x86::warp::vresize_cubic_u8(s0, s1, s2, s3, dst, b, scale, width)
+        },
+        x86::Isa::Scalar => {
+            let simd_end = if width >= 8 { (width - 8) / 8 * 8 + 8 } else { 0 };
+            for dx in 0..simd_end {
+                let acc = s0[dx] as f32 * (b[0] as f32 * scale)
+                    + s1[dx] as f32 * (b[1] as f32 * scale)
+                    + s2[dx] as f32 * (b[2] as f32 * scale)
+                    + s3[dx] as f32 * (b[3] as f32 * scale);
+                dst[dx] = acc.round_ties_even().clamp(0.0, 255.0) as u8;
+            }
+            for dx in simd_end..width {
+                let acc = s0[dx] * b[0] + s1[dx] * b[1] + s2[dx] * b[2] + s3[dx] * b[3];
+                dst[dx] = (((acc + (1 << 21)) >> 22).clamp(0, 255)) as u8;
+            }
+        }
+    }
+}
+
+/// Warp LINEAR 快路径（AVX2，每批 8 像素）。`replicate=true` 时 clamp 坐标处理
+/// Replicate 边界（覆盖全部像素）；否则仅处理 all-inlier 批，不满足返回 `false`。
+///
+/// 返回 `true` 表示已处理 `[x, x+8)` 的 8 像素（写入 `dst`），`false` 表示需回退标量。
+pub fn warp_linear_fast_u8(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    step: usize,
+    dst: &mut [u8],
+    m: &[f32],
+    pm: Option<&[f32; 9]>,
+    y: usize,
+    x: usize,
+    cn: usize,
+    replicate: bool,
+) -> bool {
+    match x86::isa() {
+        x86::Isa::Avx512 | x86::Isa::Avx2 => unsafe {
+            x86::warp::warp_linear_fast_u8(src, sw, sh, step, dst, m, pm, y, x, cn, replicate)
+        },
+        x86::Isa::Scalar => false,
+    }
+}
+
+/// Warp CUBIC 快路径（AVX2，每批 8 像素，affine/perspective + replicate 边界）。
+/// `replicate=true` 时 clamp 坐标处理 Replicate 边界（覆盖全部像素）；否则仅处理
+/// all-inlier 批，不满足返回 `false`。
+///
+/// 返回 `true` 表示已处理 `[x, x+8)` 的 8 像素（写入 `dst`），`false` 表示需回退标量。
+pub fn warp_cubic_fast_u8(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    step: usize,
+    dst: &mut [u8],
+    m: &[f32],
+    pm: Option<&[f32; 9]>,
+    y: usize,
+    x: usize,
+    cn: usize,
+    replicate: bool,
+) -> bool {
+    match x86::isa() {
+        x86::Isa::Avx512 | x86::Isa::Avx2 => unsafe {
+            x86::warp::warp_cubic_fast_u8(src, sw, sh, step, dst, m, pm, y, x, cn, replicate)
+        },
+        x86::Isa::Scalar => false,
+    }
 }
